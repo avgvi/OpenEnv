@@ -131,7 +131,7 @@ def create_surface_app(runtime: Runtime, tokens: dict[Principal, str]) -> FastAP
             if name == "grader.read_file":
                 if set(arguments) != {"path"} or not isinstance(arguments["path"], str):
                     raise ValueError("path is required")
-                result = await asyncio.to_thread(runtime.read_file, arguments["path"])
+                result = await runtime.read_file(arguments["path"])
             elif name == "grader.fs_diff":
                 if (
                     set(arguments) - {"since"}
@@ -140,7 +140,7 @@ def create_surface_app(runtime: Runtime, tokens: dict[Principal, str]) -> FastAP
                     raise ValueError("since must be reset")
                 result = [
                     change
-                    for change in await asyncio.to_thread(runtime.workspace.diff)
+                    for change in await runtime.fs_diff()
                     if policy.permits_read(Path(change["path"]))
                 ]
             else:

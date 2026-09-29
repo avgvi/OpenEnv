@@ -33,14 +33,13 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument(
         "--action-class", default="openenv.core.env_server.mcp_types:CallToolAction"
     )
-    parser.add_argument("--workspace", type=Path, help="Dedicated episode workspace")
+    parser.add_argument(
+        "--workspace", type=Path, help="Local workspace seed copied into each sandbox"
+    )
     parser.add_argument(
         "--asset-root", type=Path, help="Daemon-owned 0700 asset source directory"
     )
-    parser.add_argument("--uid", type=int, help="Reserved unprivileged workload UID")
-    parser.add_argument("--gid", type=int, help="Reserved unprivileged workload GID")
     parser.add_argument("--timeout", type=float, default=300)
-    parser.add_argument("--cgroup-root", type=Path, default=Path("/sys/fs/cgroup"))
     args = parser.parse_args(argv)
     try:
         from .policy import load_config, Principal
@@ -48,6 +47,13 @@ def main(argv: Optional[list[str]] = None) -> None:
         from .surfaces import create_surface_app
 
         config = load_config(args.manifest)
+        if config.enabled:
+            if not all((args.workspace, args.asset_root)):
+                parser.error("enabled openenvd requires --workspace and --asset-root")
+            if config.openshell is None:
+                parser.error(
+                    "enabled openenvd requires openenvd.openshell configuration"
+                )
         factory = args.factory
         action_class = args.action_class
         manifest_root = args.manifest.resolve().parent
@@ -69,21 +75,13 @@ def main(argv: Optional[list[str]] = None) -> None:
                 )
             factory = f"{env_factory.__module__}:{env_factory.__qualname__}"
             action_class = f"{action_type.__module__}:{action_type.__qualname__}"
-        if not all((args.workspace, args.asset_root, args.uid, args.gid)):
-            parser.error(
-                "--manifest requires --workspace, --asset-root, --uid, and --gid"
-            )
         runtime = Runtime(
             config,
             factory,
             action_class,
             args.workspace,
-            uid=args.uid,
-            gid=args.gid,
             asset_root=args.asset_root,
             timeout_s=args.timeout,
-            python_path=manifest_root,
-            cgroup_root=args.cgroup_root,
         )
         tokens = {
             p: os.environ.get(f"OPENENVD_{p.value.upper()}_TOKEN", "")

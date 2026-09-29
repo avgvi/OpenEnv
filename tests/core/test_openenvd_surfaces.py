@@ -18,11 +18,12 @@ def runtime(tmp_path):
     config = OpenEnvDConfig.model_validate(
         {
             "enabled": True,
+            "openshell": {"image": "test:latest", "gateway": "test"},
             "surfaces": {
                 "agent": {"tools": ["echo"]},
                 "grader": {
                     "tools": ["echo", "grader.*"],
-                    "fs_read": [str(tmp_path / "workspace") + "/**"],
+                    "fs_read": ["/workspace/**"],
                 },
                 "orchestrator": {"allow_lifecycle": True},
                 "observer": {"stream": ["process"]},
@@ -37,12 +38,11 @@ def runtime(tmp_path):
         "unused:factory",
         "unused:action",
         workspace,
-        uid=12345,
-        gid=12345,
         asset_root=tmp_path,
     )
     instance.workspace = Workspace(workspace, tmp_path / "snapshot")
     instance.workspace.capture()
+    instance._snapshot_valid = True
     instance.directory = tmp_path
     instance.start = AsyncMock()
     instance.close = AsyncMock()
@@ -179,16 +179,16 @@ def test_observer_emits_only_declared_stream(runtime):
             assert event["seq"] == 1
 
 
-def test_read_file_rejects_symlinks_and_path_traversal(runtime, tmp_path):
-    assert runtime.read_file(str(runtime.workspace_path / "answer.txt")) == "answer"
+async def test_read_file_rejects_symlinks_and_path_traversal(runtime, tmp_path):
+    assert await runtime.read_file("/workspace/answer.txt") == "answer"
     (runtime.workspace_path / "escape").symlink_to(tmp_path)
     for path in (
-        runtime.workspace_path / "escape" / "secret",
-        runtime.workspace_path / ".." / "secret",
+        Path("/workspace/escape/secret"),
+        Path("/workspace/../secret"),
         Path("/etc/passwd"),
     ):
         with pytest.raises((OSError, PermissionError)):
-            runtime.read_file(str(path))
+            await runtime.read_file(str(path))
 
 
 def test_workspace_restore_and_diff_do_not_follow_links(tmp_path):

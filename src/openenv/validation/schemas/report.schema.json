@@ -132,57 +132,6 @@
       "title": "CheckStatus",
       "type": "string"
     },
-    "EgressPolicy": {
-      "additionalProperties": false,
-      "description": "Default-deny egress policy for the workload's kernel network.",
-      "properties": {
-        "allow": {
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/EgressRule"
-          },
-          "title": "Allow",
-          "type": "array"
-        }
-      },
-      "title": "EgressPolicy",
-      "type": "object"
-    },
-    "EgressRule": {
-      "additionalProperties": false,
-      "description": "Explicit IPv4 destination, protocol, and ports; special ranges stay denied.",
-      "properties": {
-        "cidr": {
-          "title": "Cidr",
-          "type": "string"
-        },
-        "ports": {
-          "items": {
-            "maximum": 65535,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "minItems": 1,
-          "title": "Ports",
-          "type": "array"
-        },
-        "protocol": {
-          "enum": [
-            "tcp",
-            "udp"
-          ],
-          "title": "Protocol",
-          "type": "string"
-        }
-      },
-      "required": [
-        "cidr",
-        "protocol",
-        "ports"
-      ],
-      "title": "EgressRule",
-      "type": "object"
-    },
     "JudgePin": {
       "additionalProperties": false,
       "description": "Pinned judge configuration. Required iff `capabilities.llm_judged`.\n\nThe pin lives in the manifest, not the rubric object: `LLMJudge.state_dict()` does\nnot serialize model/version/params, so validation checks the declared pin.",
@@ -343,8 +292,16 @@
           "title": "Enabled",
           "type": "boolean"
         },
-        "network": {
-          "$ref": "#/$defs/EgressPolicy"
+        "openshell": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpenShellConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "privileged_assets": {
           "additionalProperties": {
@@ -365,6 +322,43 @@
         }
       },
       "title": "OpenEnvDConfig",
+      "type": "object"
+    },
+    "OpenShellConfig": {
+      "additionalProperties": false,
+      "description": "OpenShell gateway, image, and native sandbox policy for each episode.\n\nThe image must contain the environment and OpenEnv installation. Network\npolicy uses OpenShell's native schema and is validated by OpenShell itself.",
+      "properties": {
+        "gateway": {
+          "minLength": 1,
+          "title": "Gateway",
+          "type": "string"
+        },
+        "image": {
+          "minLength": 1,
+          "title": "Image",
+          "type": "string"
+        },
+        "policy": {
+          "additionalProperties": true,
+          "title": "Policy",
+          "type": "object"
+        },
+        "python": {
+          "default": "/usr/local/bin/python3",
+          "title": "Python",
+          "type": "string"
+        },
+        "workspace": {
+          "default": "default",
+          "title": "Workspace",
+          "type": "string"
+        }
+      },
+      "required": [
+        "image",
+        "gateway"
+      ],
+      "title": "OpenShellConfig",
       "type": "object"
     },
     "OracleDeclaration": {

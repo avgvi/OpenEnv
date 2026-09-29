@@ -5,6 +5,7 @@
 from unittest.mock import Mock
 
 import pytest
+import yaml
 from openenv.core.openenvd import daemon
 
 
@@ -49,7 +50,17 @@ def test_manifest_discovers_factory_without_environment_code_changes(
     from openenv.core.openenvd import daemon, runtime, surfaces
 
     manifest = tmp_path / "openenv.yaml"
-    manifest.write_text("app: example.app:app\nopenenvd:\n  enabled: true\n")
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "app": "example.app:app",
+                "openenvd": {
+                    "enabled": True,
+                    "openshell": {"image": "example:latest", "gateway": "local"},
+                },
+            }
+        )
+    )
     env_factory = SimpleNamespace(__module__="example.env", __qualname__="Environment")
     action_type = SimpleNamespace(__module__="example.models", __qualname__="Action")
     original_app = SimpleNamespace(
@@ -72,13 +83,49 @@ def test_manifest_discovers_factory_without_environment_code_changes(
             str(tmp_path),
             "--asset-root",
             str(tmp_path),
-            "--uid",
-            "12345",
-            "--gid",
-            "12345",
         ]
     )
     assert runtime_factory.call_args.args[1:3] == (
         "example.env:Environment",
         "example.models:Action",
     )
+    assert runtime_factory.call_args.kwargs == {
+        "asset_root": tmp_path,
+        "timeout_s": 300,
+    }
+
+
+@pytest.mark.parametrize(
+    ("arguments", "openshell", "message"),
+    [
+        ([], {"image": "example:latest", "gateway": "local"}, "--workspace"),
+        (
+            ["--workspace", "."],
+            {"image": "example:latest", "gateway": "local"},
+            "--asset-root",
+        ),
+        (["--workspace", ".", "--asset-root", "."], None, "openenvd.openshell"),
+    ],
+)
+def test_enabled_manifest_requires_sandbox_inputs_before_import(
+    tmp_path, monkeypatch, capsys, arguments, openshell, message
+):
+    manifest = tmp_path / "openenv.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "app": "example.app:app",
+                "openenvd": {"enabled": True, "openshell": openshell},
+            }
+        )
+    )
+    import_module = Mock()
+    monkeypatch.setattr(daemon.importlib, "import_module", import_module)
+    run = Mock()
+    monkeypatch.setattr(daemon.uvicorn, "run", run)
+    with pytest.raises(SystemExit) as error:
+        daemon.main(["--manifest", str(manifest), *arguments])
+    assert error.value.code == 2
+    assert message in capsys.readouterr().err
+    import_module.assert_not_called()
+    run.assert_not_called()

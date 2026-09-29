@@ -116,9 +116,8 @@ class Workspace:
                                 remaining -= len(chunk)
                             # Read exactly the initial size: concurrent growth
                             # must not turn an observation into an endless read.
-                            digest.update(
-                                f"{file_info.st_size}:{file_info.st_mtime_ns}".encode()
-                            )
+                            # Transfers can change mtimes. Compare file content
+                            # and permissions, not the time it was downloaded.
                             result[relative] = (
                                 f"file:{stat.S_IMODE(info.st_mode)}:{digest.hexdigest()}"
                             )

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""Private environment worker, reachable only through an inherited socket.
+"""Environment worker controlled by the daemon's protected SSH stdio stream.
 
-The supervisor owns the socket's containing directory (0700). No TCP listener
-or abstract Unix socket exposes lifecycle controls inside the workload namespace.
+The bootstrap saves the original stdin/stdout as private noninheritable
+descriptors before importing this module. No local listener exposes lifecycle
+controls. The optional loopback MCP listener contains agent tools only.
 """
 
 from __future__ import annotations
@@ -12,8 +13,6 @@ import importlib
 import inspect
 import json
 import os
-import socket
-import sys
 from contextlib import AsyncExitStack
 
 import uvicorn
@@ -33,10 +32,78 @@ from openenv.core.env_server.serialization import (
 
 from .harness import HarnessEventSink
 from .mcp import http_rpc, mcp_handler, socket_rpc
-from .policy import SurfacePolicy
+from .policy import Principal, SurfacePolicy
 
 
-async def serve(fd: int, factory_name: str, action_name: str) -> None:
+async def serve(control_read: int, control_write: int) -> None:
+    loop = asyncio.get_running_loop()
+    reader = asyncio.StreamReader(limit=16 * 1024 * 1024)
+    input_transport, _ = await loop.connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(reader), os.fdopen(control_read, "rb")
+    )
+    output_transport, output_protocol = await loop.connect_write_pipe(
+        asyncio.streams.FlowControlMixin, os.fdopen(control_write, "wb")
+    )
+    writer = asyncio.StreamWriter(output_transport, output_protocol, None, loop)
+    output_lock = asyncio.Lock()
+
+    async def send(frame):
+        async with output_lock:
+            writer.write(json.dumps(frame).encode() + b"\n")
+            await writer.drain()
+
+    event_read, event_write = os.pipe()
+    os.set_inheritable(event_read, False)
+    os.set_inheritable(event_write, False)
+    os.set_blocking(event_write, False)
+    os.environ["OPENENVD_EVENT_FD"] = str(event_write)
+    events = asyncio.StreamReader(limit=65536)
+    event_transport, _ = await loop.connect_read_pipe(
+        lambda: asyncio.StreamReaderProtocol(events), os.fdopen(event_read, "rb")
+    )
+    ready = asyncio.Event()
+
+    async def forward_events():
+        while line := await events.readline():
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise ValueError("invalid harness event")
+            await ready.wait()
+            await send({"event": event})
+
+    tasks = [asyncio.create_task(forward_events())]
+    env = None
+    try:
+        config = json.loads(await reader.readline())
+        if not isinstance(config, dict) or set(config) != {
+            "factory",
+            "action_class",
+            "agent_policy",
+        }:
+            raise ValueError("invalid worker configuration")
+        policy = (
+            SurfacePolicy.model_validate(config["agent_policy"])
+            if config["agent_policy"] is not None
+            else None
+        )
+        if policy is not None and policy.principal != Principal.AGENT:
+            raise ValueError("local surface requires an agent policy")
+        env, action_cls = create_environment(config["factory"], config["action_class"])
+        await run_environment(env, action_cls, policy, reader, send, ready, tasks)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if env is not None:
+            await invoke(env.close)
+        os.environ.pop("OPENENVD_EVENT_FD", None)
+        os.close(event_write)
+        event_transport.close()
+        input_transport.close()
+        writer.close()
+
+
+def create_environment(factory_name, action_name):
     def resolve(name):
         module, attribute = name.split(":", 1)
         value = importlib.import_module(module)
@@ -44,17 +111,17 @@ async def serve(fd: int, factory_name: str, action_name: str) -> None:
             value = getattr(value, component)
         return value
 
-    event_fd = os.environ.get("OPENENVD_EVENT_FD")
-    if event_fd is not None:
-        os.set_inheritable(int(event_fd), False)
-    env = resolve(factory_name)()
-    action_cls = resolve(action_name)
-    lock = asyncio.Lock()
+    return resolve(factory_name)(), resolve(action_name)
 
-    async def invoke(method, *args, **kwargs):
-        if inspect.iscoroutinefunction(method):
-            return await method(*args, **kwargs)
-        return await asyncio.to_thread(method, *args, **kwargs)
+
+async def invoke(method, *args, **kwargs):
+    if inspect.iscoroutinefunction(method):
+        return await method(*args, **kwargs)
+    return await asyncio.to_thread(method, *args, **kwargs)
+
+
+async def run_environment(env, action_cls, policy, reader, send, ready, tasks):
+    lock = asyncio.Lock()
 
     async def dispatch(request):
         operation = request["operation"]
@@ -114,12 +181,12 @@ async def serve(fd: int, factory_name: str, action_name: str) -> None:
 
     def local_agent_app(policy):
         app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
-        sink = HarnessEventSink() if event_fd is not None else None
+        sink = HarnessEventSink()
 
         async def agent_dispatch(data):
             async with lock:
                 response = await dispatch({"operation": "mcp", "data": data})
-            if sink and data["method"] == "tools/call":
+            if data["method"] == "tools/call":
                 sink(
                     {
                         "type": "tool_call",
@@ -140,59 +207,51 @@ async def serve(fd: int, factory_name: str, action_name: str) -> None:
 
         return app
 
-    async def handle(reader, writer):
-        try:
-            while line := await reader.readline():
-                try:
-                    async with lock:
-                        result = await dispatch(json.loads(line))
-                    response = {"result": result}
-                except Exception:
-                    response = {"error": "environment operation failed"}
-                writer.write(json.dumps(response).encode() + b"\n")
-                await writer.drain()
-        finally:
-            writer.close()
-            await writer.wait_closed()
+    async def handle():
+        while line := await reader.readline():
+            try:
+                async with lock:
+                    result = await dispatch(json.loads(line))
+                response = {"result": result}
+            except Exception:
+                response = {"error": "environment operation failed"}
+            await send(response)
 
-    sock = socket.socket(fileno=fd)
-    sock.set_inheritable(False)
     async with AsyncExitStack() as stack:
         session = getattr(env, "mcp_session", None)
         if session:
             await stack.enter_async_context(session())
-        server = await asyncio.start_unix_server(
-            handle, sock=sock, limit=16 * 1024 * 1024
-        )
-        async with server:
-            try:
-                policy_json = os.environ.get("OPENENVD_AGENT_POLICY")
-                if policy_json:
-                    policy = SurfacePolicy.model_validate_json(policy_json)
-                    local_server = uvicorn.Server(
-                        uvicorn.Config(
-                            local_agent_app(policy),
-                            host="127.0.0.1",
-                            port=int(os.environ.get("OPENENVD_AGENT_PORT", "8000")),
-                            log_level="warning",
-                            access_log=False,
-                        )
+        try:
+            if policy is not None:
+                local_server = uvicorn.Server(
+                    uvicorn.Config(
+                        local_agent_app(policy),
+                        host="127.0.0.1",
+                        port=int(os.environ.get("OPENENVD_AGENT_PORT", "8000")),
+                        log_level="warning",
+                        access_log=False,
                     )
-                    tasks = [
-                        asyncio.create_task(server.serve_forever()),
-                        asyncio.create_task(local_server.serve()),
-                    ]
-                    try:
-                        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-                    finally:
-                        for task in tasks:
-                            task.cancel()
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                else:
-                    await server.serve_forever()
-            finally:
-                await invoke(env.close)
+                )
+                server_task = asyncio.create_task(local_server.serve())
+                tasks.append(server_task)
+                while not local_server.started:
+                    if server_task.done():
+                        await server_task
+                        raise RuntimeError("agent listener did not start")
+                    await asyncio.sleep(0.01)
+            await send({"result": {"ready": True}})
+            ready.set()
+            tasks.append(asyncio.create_task(handle()))
+            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                await task
+        finally:
+            # Stop dispatch before closing the environment's shared MCP session.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
-if __name__ == "__main__":
-    asyncio.run(serve(int(sys.argv[1]), sys.argv[2], sys.argv[3]))
+def main(control_read: int, control_write: int) -> None:
+    """Run only after the standalone bootstrap has protected the control channel."""
+    asyncio.run(serve(control_read, control_write))
