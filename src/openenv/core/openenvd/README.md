@@ -1,45 +1,64 @@
 # openenvd: policy-scoped environment runtime
 
-`openenvd` provides an opt-in runtime for [RFC 009](../../../../rfcs/009-openenvd.md):
-one environment workload, a dedicated episode workspace, and separate agent,
-grader, orchestrator, and observer surfaces.
+`openenvd` implements the opt-in runtime for [RFC 009](../../../../rfcs/009-openenvd.md)
+using NVIDIA OpenShell for workload isolation. The daemon keeps the agent, grader,
+orchestrator, and observer surfaces outside the sandbox. Each episode runs one
+environment in a fresh OpenShell sandbox.
 
-## Environment runtime
+## Prepare the gateway and image
 
-The runtime requires Linux root, permission to create named network namespaces,
-veth interfaces and nftables rules, and writable cgroup v2 supporting
-`cgroup.kill`. Startup fails if these requirements cannot be met. Reserve a
-dedicated nonzero UID/GID for the workload. The outer container remains responsible
-for host containment and resource limits. Install OpenEnv and the environment's
-dependencies in the daemon's interpreter. Environment factory code is trusted;
-its untrusted subprocesses run under the workload identity. Children receive a
-minimal environment without daemon secrets.
+Install the [OpenShell v0.1.2 CLI](https://github.com/NVIDIA/OpenShell/releases/tag/v0.1.2)
+and OpenSSH (`ssh`) on the daemon host. The adapter accepts stable OpenShell
+versions `>=0.1.2,<0.2`. Configure a reachable gateway using the
+[OpenShell gateway guide](https://docs.nvidia.com/openshell/latest/how-it-works/gateways/overview),
+and select its name explicitly in the manifest. The gateway must support the
+policy's required Landlock enforcement. The daemon itself does not need Linux
+root privileges, network administration capabilities, or a writable cgroup tree.
 
-The base container image includes `iproute2`, `nftables`, `conntrack`,
-`libseccomp2`, and `libnetfilter-log1`. Source installations need those system
-packages too (`libnetfilter-log1` is required when network observation is enabled).
-Enable IPv4 forwarding in the daemon's network namespace (for Docker, `--sysctl net.ipv4.ip_forward=1`).
-The runtime checks this setting without changing host-wide sysctls. The kernel
-must support veth, nftables NAT/conntrack, and NFLOG when network observation is
-enabled. Python manages these facilities; no additional language toolchain or
-userspace TCP/IP stack is required. Existing host firewall rules may further
-restrict allowed traffic; openenvd never flushes or replaces them.
+The sandbox image must contain Python, `/bin/tar`, this OpenEnv implementation,
+and the environment factory and action classes. Install them under read-only
+paths such as `/usr/local` and `/opt`; `/sandbox` must be writable by the configured process
+identity (UID and GID `1000` by default). A minimal echo environment image can be
+built from the repository root with this `Dockerfile.openshell`:
 
-Prepare an existing, dedicated workspace writable by the workload UID/GID, with
-parent paths it can traverse. The immediate parent must be daemon-owned and
-not writable by group or others, so the workload cannot rename its workspace
-during restoration. Reset restores the startup snapshot and preserves the
-original UID/GID of each path. Initial workspace permissions must already allow
-the intended workload writes. Do not use a shared checkout
-or a directory containing privileged assets. Keep asset sources outside the
-workspace under a daemon-owned directory with mode `0700`; protect the originals
-as well as the daemon's private copies.
+```dockerfile
+FROM python:3.13-slim
+WORKDIR /opt/openenv
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+COPY envs/echo_env ./envs/echo_env
+RUN test -x /bin/tar \
+    && pip install --no-cache-dir -e . -e ./envs/echo_env \
+    && groupadd --gid 1000 sandbox \
+    && useradd --uid 1000 --gid 1000 --no-create-home --home-dir /sandbox sandbox \
+    && mkdir -p /sandbox \
+    && chown 1000:1000 /sandbox
+USER 1000:1000
+WORKDIR /sandbox
+```
 
-Add a policy section to the environment's `openenv.yaml`, for example:
+```bash
+docker build -f Dockerfile.openshell -t openenv-echo:openshell .
+```
+
+Make the image available to the selected gateway, for example through a registry
+it can pull from, and use that image reference in `openenvd.openshell.image`.
+Building an image locally does not by itself make it available to a remote gateway.
+The daemon uses its own OpenShell gateway credentials; those credentials and
+principal tokens are not forwarded to the workload. Automatic provider attachment
+is disabled.
+
+## Configure and launch
+
+Add the following section to the environment's `openenv.yaml`:
 
 ```yaml
 openenvd:
   enabled: true
+  openshell:
+    image: openenv-echo:openshell
+    gateway: local
+    workspace: default
   surfaces:
     orchestrator:
       allow_lifecycle: true
@@ -49,49 +68,86 @@ openenvd:
       tools: [grader.read_file, grader.fs_diff, grader.get_trajectory]
       fs_read: ['/workspace/**', '/openenvd/assets/**']
     observer:
-      stream: [harness_events, fs_diff, process, resource]
-  privileged_assets:
-    solution: solution.txt
+      stream: [harness_events, fs_diff, process]
 ```
 
-Replace the agent tool names with the environment's tools. Permissions are
-allowlists; omitted permissions are denied. Agent tool patterns accept a literal
-name or trailing `*`, and cannot include lifecycle or `grader.*` tools. Observers
-receive streams only. Asset source paths are relative to `--asset-root`; graders
-address copies as `/openenvd/assets/<name>`. `fs_read` is supported only for graders; declarations for other principals are
-rejected. Agent tools access files under the workload's OS permissions, which also
-protect privileged assets.
+`openshell.workspace` selects the OpenShell gateway workspace. The separate
+`--workspace` argument selects a local directory whose initial contents seed
+each episode. It may contain only regular files and directories. The daemon
+captures this seed once and uploads a copy to `/sandbox/workspace` in each fresh
+sandbox; workload changes never modify the local seed. Keep privileged assets
+in a separate local directory, outside the seed.
 
-Supply distinct, high-entropy secrets through deployment configuration:
-`OPENENVD_ORCHESTRATOR_TOKEN`, `OPENENVD_GRADER_TOKEN`, and
-`OPENENVD_OBSERVER_TOKEN` for each configured privileged principal. Launch with:
+Replace agent tool names with the environment's tools. Permissions are explicit
+allowlists; omitted permissions are denied. Agent patterns accept a literal name
+or trailing `*` and cannot include lifecycle or `grader.*` tools. Observers expose
+streams only, and `fs_read` permissions apply only to graders.
+
+Supply distinct, high-entropy credentials through deployment configuration for
+each configured privileged principal: `OPENENVD_ORCHESTRATOR_TOKEN`,
+`OPENENVD_GRADER_TOKEN`, and `OPENENVD_OBSERVER_TOKEN`. For the echo image above,
+launch with installed, fully qualified package names:
 
 ```bash
+mkdir -p ./workspace-seed ./private-assets
+chmod 700 ./private-assets
 python -m openenv.core.openenvd \
-  --manifest /opt/environment/openenv.yaml \
-  --workspace /workspace \
-  --asset-root /opt/private-assets \
-  --uid 65536 --gid 65536 \
+  --manifest envs/echo_env/openenv.yaml \
+  --factory echo_env.server.echo_environment:EchoEnvironment \
+  --action-class openenv.core.env_server.mcp_types:CallToolAction \
+  --workspace ./workspace-seed \
+  --asset-root ./private-assets \
   --timeout 300
 ```
 
-For standard apps built with `create_app`, the runtime discovers the environment
-factory and action class from the manifest's app entry. Alternatively pass
-`--factory my_environment.server.environment:MyEnvironment` and, when needed,
-`--action-class module:Class`. An explicit factory constructs an environment
-without arguments. The manifest directory is available for worker imports;
-install the environment package when it is not importable from that directory.
-The worker does not inherit the daemon's ambient `PYTHONPATH`.
+An explicit factory constructs the environment without arguments. For standard
+apps built with `create_app`, omitting `--factory` discovers the factory and
+action class by importing the manifest's app on the daemon host. Those discovered
+module names must also be importable from the installed sandbox image. The host
+manifest directory and ambient `PYTHONPATH` are not copied into the sandbox.
 
-`--cgroup-root` selects a delegated writable cgroup v2 root (default
-`/sys/fs/cgroup`); the runtime creates its workload cgroup beneath it.
-`--host` defaults to `127.0.0.1` and `--port` to `8100`. Exposing another address
-requires deployment-provided TLS and network access controls. The agent endpoint
-has no additional credentials.
+`--manifest` is required. An absent or disabled `openenvd` section runs the
+manifest's original app unchanged. Enabled startup additionally requires
+`openenvd.openshell`, `--workspace`, and `--asset-root`. The former `--uid`,
+`--gid`, and `--cgroup-root` flags are replaced by OpenShell policy and gateway
+configuration. `--host` defaults to `127.0.0.1`, and `--port` defaults to `8100`.
+Deployments that expose another address must supply TLS and network access
+controls; the agent endpoint has no additional credentials.
 
-`--manifest` is required. If its `openenvd` section is absent or disabled, the
-CLI runs the manifest's original app unchanged; workspace, asset-root, and
-workload identity arguments are only required when `openenvd` is enabled.
+## Native sandbox policy
+
+Omitting `openshell.policy` uses the following OpenShell policy:
+
+```yaml
+version: 1
+filesystem_policy:
+  include_workdir: false
+  read_only: [/bin, /usr, /lib, /lib64, /etc, /proc, /opt, /dev/urandom]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock:
+  compatibility: hard_requirement
+process:
+  run_as_user: '1000'
+  run_as_group: '1000'
+network_policies: {}
+network_middlewares: {}
+```
+
+To customize it, put a complete native policy mapping under `openshell.policy`.
+Network destinations, binaries, and protocols use
+[OpenShell's policy schema](https://docs.nvidia.com/openshell/latest/how-it-works/policies/overview);
+there is no translation from the former `openenvd.network` CIDR allowlist.
+The default has no egress allowances. OpenShell validates the native policy, and
+openenvd checks the effective policy before running the environment.
+
+OpenEnv requires `landlock.compatibility: hard_requirement`, explicit positive
+numeric user and group IDs, and `include_workdir: false`. Writable paths must be
+inside `/sandbox` or `/tmp`, or exactly `/dev/null`. The Python interpreter
+(default `/usr/local/bin/python3`, configurable as `openshell.python`) must be an
+absolute path outside writable paths. Keep installed runtime and environment
+code read-only.
+
+## Principal surfaces and episode lifecycle
 
 | Surface | Transport | Access |
 | --- | --- | --- |
@@ -101,46 +157,76 @@ workload identity arguments are only required when `openenvd` is enabled.
 | Observer | WebSocket `/observe` | Observer bearer token; allowed streams |
 | Health | HTTP GET `/health` | Minimal unauthenticated status |
 
-When an agent policy is configured, an agent-only HTTP/WebSocket `/mcp`
-listener inside the workload's network namespace runs at `127.0.0.1:8000` for local harnesses. It exposes no privileged
-routes. HTTP MCP logical session creation and closure do not reset the episode;
-only the authenticated orchestrator controls reset.
+The daemon controls the worker over an authenticated SSH connection with a
+private standard-input/output channel protected before environment imports.
+When an agent policy is configured, the sandbox also provides an agent-only
+HTTP/WebSocket `/mcp` listener at `127.0.0.1:8000` for local harnesses. It has no
+privileged routes. MCP session creation and closure do not reset the episode.
 
-The runtime enables Linux child-subreaper behavior and reaps adopted workload
-children. Reset kills the workload cgroup, restores the startup workspace snapshot, clears
-episode observations, and starts a fresh environment before forwarding reset
-arguments. Workload exit and timeout trigger cgroup cleanup. Reset covers the
-dedicated workspace, not every writable container path. Workload state that
-could outlive `cgroup.kill` and workspace restore is prevented before executing
-workload code. `libseccomp` compiles a named syscall denylist for SysV IPC, POSIX
-message queues, keyrings, and mounting, including rejection of unsupported ABIs.
-Private IPC and mount namespaces contain IPC resources; root-only tmpfs mounts
-over `/dev/shm` and `/dev/mqueue` deny direct filesystem-backed IPC access without
-changing permissions on the daemon's mounts. `/dev/fuse` is hidden by a private
-bind of `/dev/null`. Failed isolation setup prevents workload execution. Teardown
-kills the cgroup and lets the kernel reclaim its namespaces; it does not sweep
-shared host IPC objects or keyrings by UID. Reserve a dedicated UID and do not run
-other, unsandboxed processes under it. If the cgroup will not empty, reset fails closed with
-`teardown incomplete: workload cgroup did not empty; workspace restore refused`.
+Reset stops the current worker and requires confirmed deletion of its OpenShell
+sandbox before starting a fresh sandbox from the captured seed. Cleanup failure
+prevents the next episode. Workload exit and timeout also trigger sandbox
+cleanup; there is no automatic workload restart. Only the authenticated
+orchestrator controls lifecycle operations.
+
+Sandboxes use OpenShell's ephemeral retention and a finite main process lasting
+`4 × --timeout + 60` seconds. Main-process exit provides a best-effort cleanup
+backstop after daemon crashes; OpenShell 0.1 does not enforce a sandbox TTL.
+
+## Grading and observations
 
 Grader tools are `grader.read_file`, `grader.fs_diff`, `grader.get_full_state`,
-`grader.get_trajectory`, and `grader.run_oracle`. Each requires an explicit tool
-allowlist entry. File reads require `fs_read` permission and accept regular UTF-8
-files up to 1 MiB under managed roots, rejecting symlinks. Oracle execution also
-requires `allow_privileged_exec: true` and an executable asset named `oracle`.
-The oracle is trusted operator code running with daemon privileges and a minimal
-environment; callers cannot supply an arbitrary command.
+`grader.get_trajectory`, and `grader.run_oracle`. Each needs an explicit tool
+allowlist entry. Workspace reads and diffs use downloaded snapshots, addressed
+with logical paths under `/workspace`; the live sandbox path is
+`/sandbox/workspace`. File reads additionally require `fs_read` permission and
+accept regular UTF-8 files up to 1 MiB. Symlinks and special files are rejected.
+Snapshots are exported over authenticated SSH with limits of 64 MiB and 4096
+entries, and archive entries are checked before they are written on the host.
+Snapshot exports are not atomic and may span workload writes.
+Forced teardown without a final snapshot leaves workspace grading unavailable
+until reset.
 
-Programmatic entry points are `Principal`, `SurfacePolicy`, `OpenEnvDConfig`,
-`Runtime`, and `create_surface_app` from `openenv.core.openenvd`. Client exports
-load without importing server implementations. Harness adapters
-can publish through
+Declare private grading inputs with `privileged_assets`, for example:
+
+```yaml
+openenvd:
+  # Keep the enabled, openshell, and surfaces sections shown above.
+  privileged_assets:
+    solution: solution.txt
+    oracle: grade.sh
+```
+
+Asset sources are relative to `--asset-root`. The daemon keeps private copies
+addressable by permitted graders as `/openenvd/assets/<name>`; assets are never
+uploaded to the agent sandbox. Oracle execution also requires
+`allow_privileged_exec: true` on the grader policy, the `grader.run_oracle` tool
+allowance, and an executable asset named `oracle`. The oracle runs in a separate,
+short-lived OpenShell sandbox using the configured image and policy. It receives
+a downloaded workspace snapshot and the private grading assets, staged together
+in a private asset directory inside that grader sandbox. Oracle output is
+returned to the grader, and its writes are not copied back to the agent. The
+grader sandbox is deleted after execution. Callers cannot supply an arbitrary
+command.
+
+Supported observer streams are `harness_events`, `fs_diff`, and `process`.
+Harness events are workload self-reports, and process events describe worker and
+sandbox lifecycle rather than all processes inside the sandbox. Filesystem
+sampling can miss transient changes; downloaded snapshots are not atomic.
+Fingerprints hash complete files up to 64 MiB and reject oversized files.
+Events are retained in bounded daemon memory, and sequence numbers restart on
+reset. `network` and `resource` observer streams are rejected until OpenShell
+telemetry is integrated.
+
+Harness adapters can publish through
 [`MCPHarnessAdapter(event_sink=HarnessEventSink())`](../harness/README.md#openenvd-event-publication).
+Public entry points include `Principal`, `SurfacePolicy`, `OpenShellConfig`,
+`OpenEnvDConfig`, `Runtime`, and `create_surface_app`. Clients load without
+importing server implementation modules.
 
 ### Connect from orchestration and grading code
 
-Pass the orchestrator credential using the optional `EnvClient.headers`
-parameter, also supported by `GenericEnvClient`:
+`EnvClient` and `GenericEnvClient` accept optional authentication headers:
 
 ```python
 import os
@@ -157,10 +243,9 @@ async def reset_episode():
         return await env.reset()
 ```
 
-Use the separate public client for grader MCP calls. `call_tool` returns the
-MCP result envelope; `run_oracle` decodes its JSON text into the oracle result.
-The latter requires the oracle permission and asset described above, which are
-not enabled in the minimal policy example.
+`GraderClient.call_tool` returns the MCP result envelope. `run_oracle` decodes
+its JSON text into the oracle result and requires the optional oracle permissions
+and asset described above.
 
 ```python
 import os
@@ -172,10 +257,7 @@ async def grade():
         "http://127.0.0.1:8100/mcp/grader",
         os.environ["OPENENVD_GRADER_TOKEN"],
     ) as grader:
-        tools = await grader.list_tools()
-        diff = await grader.call_tool("grader.fs_diff", {"since": "reset"})
-        oracle = await grader.run_oracle()
-        return tools, diff, oracle
+        return await grader.call_tool("grader.fs_diff", {"since": "reset"})
 
 async def monitor():
     async for event in observer_stream(
@@ -185,94 +267,35 @@ async def monitor():
         print(event["type"], event["data"])
 ```
 
-The observer client yields decoded JSON dictionaries with `seq`, `ts`, `type`,
-and `data`. Sequence numbers restart on episode reset. These clients do not
-compute rewards; environment-side graders or rubrics retain that responsibility.
+Observer events contain `seq`, `ts`, `type`, and `data`. These clients do not
+compute rewards; environment-side graders and rubrics retain that responsibility.
 
-### Observation and implementation limits
+RFC 008 validation preserves the policy under `manifest.openenvd` in
+`openenv validate --json`; invalid policies produce a `static.manifest` failure.
+Its contract graders do not yet use this runtime or the privileged grader
+surface. Separate harness process delegation and `env.trajectory` integration
+are also not provided.
 
-Typed episode events (`harness_event`, `fs_change`, `process`, `network`,
-`resource`) are retained in bounded daemon memory, not a durable audit store.
-Harness events are workload reports, not proof of OS operations. Filesystem,
-process, and resource sampling can miss transient changes. Continuous filesystem,
-process, and resource samples are collected only for explicitly configured observer
-streams. Filesystem hashing runs outside the action/reset lock; samples spanning
-a reset are discarded. The startup snapshot remains available for reset and
-on-demand grader diffs. Snapshot capture copies files and records ownership
-without hashing. Baseline fingerprints are computed lazily from the immutable
-snapshot when filesystem observation or a grader diff first needs them. Workspace
-scans are not atomic. File fingerprints hash complete files up to 64 MiB; oversized files
-cause observation to fail explicitly rather than using a partial fingerprint.
-Resource samples include CPU, memory, and workspace `disk_bytes`.
+## Verification
 
-Each episode gets a private network namespace with loopback for the agent MCP
-listener and a veth interface for external traffic. Python installs nftables
-rules on the daemon side before enabling either interface. The Linux kernel
-handles routing, TCP/UDP, connection tracking, and source NAT. All egress is denied
-unless explicitly allowed in the manifest, for example:
-
-```yaml
-openenvd:
-  enabled: true
-  network:
-    allow:
-      - cidr: 1.1.1.1/32
-        protocol: udp
-        ports: [53]
-      - cidr: 1.1.1.1/32
-        protocol: tcp
-        ports: [53, 443]
-```
-
-Rules require canonical IPv4 CIDRs, a protocol (`tcp` or `udp`), and explicit
-ports. Loopback, private, link-local/metadata, shared-address, multicast, reserved
-ranges, and all daemon-local addresses remain denied even under a broad allow
-rule. IPv6 cannot leave the workload. DNS requires its own resolver allowances;
-the runtime does not rewrite resolver configuration or implement hostname rules.
-Allowing an external proxy authorizes that proxy's service, including any onward
-access it provides; destination rules do not inspect application payloads.
-
-Adding `network` to observer streams enables NFLOG packet-policy events, decoded
-by the system `libnetfilter_log` library, from
-before workload initialization. Events contain destination, protocol, and an
-`allow` or `deny` outcome. An allowance records a firewall decision, not successful
-upstream connection establishment. Retransmissions may produce repeated events;
-established packets are not individually logged. Namespace-local loopback and
-application payloads are not retained. No `strace` or ptrace permission is required.
-Socket overruns, detected sequence gaps, or observation buffering failures stop
-the episode rather than silently discard observations.
-
-A Python supervisor owns the network lifecycle and detects daemon exit through a
-private pipe. Reset and close disconnect the veth, remove that episode's conntrack
-entries, and delete its firewall table and namespace before another episode starts.
-One daemon-owned, atomically updated record under `/run/openenvd-networks`
-serves as both the address reservation and cleanup journal. It supports cleanup
-after supervisor death; incomplete cleanup
-prevents reset. Episode addresses are allocated from unused /30 subnets within
-198.18.0.0/15. Allocation and cleanup are serialized to prevent stale connection
-state from surviving address reuse. Kernel connection-tracking capacity and the
-outer container's resource limits apply to allowed traffic.
-
-RFC 008 validation includes the top-level `openenvd` policy in its normalized
-manifest. `openenv validate --json` preserves it under `manifest.openenvd`, and
-invalid policies produce a `static.manifest` failure. Contract graders do not yet
-use openenvd's runtime or privileged grader surface. Deployment still requires
-explicit workspace, asset-root, and identity CLI arguments; there is no YAML-only
-startup. A manifest with `openenvd` absent or disabled runs the original app.
-These observation and deployment limits mean this implementation does not yet
-provide every guarantee in RFC 009. The runtime does not automatically restart crashed workloads;
-a subsequent reset starts a fresh workload. Harness event publication remains opt-in and keeps adapter
-buffers; separate harness process delegation and `env.trajectory` integration
-are not provided. `GraderClient.run_oracle()` is a reference consumer, not an
-integration into a normalized RFC 008 contract-grader runner.
-
-### Verification
+Run the portable unit and contract tests with:
 
 ```bash
 PYTHONPATH=src:envs uv run pytest tests/core/test_openenvd*.py -q
 ```
 
-The `openenvd.yml` CI workflow runs on native Linux as root with an `/opt` virtual
-environment and the installed echo environment package. A mandatory capability
-probe verifies UID separation, network namespaces and writable cgroup v2 before
-running tests; portable tests alone do not validate those OS boundaries.
+These tests exercise configuration, sandbox lifecycle commands, worker
+transport, principal boundaries, and grading with a simulated gateway. They do
+not verify a live OpenShell deployment. Optional live integration tests require
+an available gateway and an image built with this implementation and the echo
+environment:
+
+```bash
+OPENSHELL_TEST_GATEWAY=local \
+OPENSHELL_TEST_IMAGE=openenv-echo:openshell \
+PYTHONPATH=src:envs uv run pytest tests/core/test_openenvd*.py -q
+```
+
+Without those environment variables, live tests skip. Passing portable tests
+alone does not establish that the gateway, image, and host support the required
+isolation policy.

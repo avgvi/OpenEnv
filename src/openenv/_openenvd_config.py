@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
+import re
 from enum import Enum
 from fnmatch import fnmatchcase
-from ipaddress import IPv4Network
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any, Literal
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
@@ -104,28 +104,109 @@ class SurfacePolicy(BaseModel):
         return any(fnmatchcase(str(path), pattern) for pattern in self.fs_read)
 
 
-class EgressRule(BaseModel):
-    """Explicit IPv4 destination, protocol, and ports; special ranges stay denied."""
+def _default_openshell_policy() -> dict[str, Any]:
+    return {
+        "version": 1,
+        "filesystem_policy": {
+            "include_workdir": False,
+            "read_only": [
+                "/bin",
+                "/usr",
+                "/lib",
+                "/lib64",
+                "/etc",
+                "/proc",
+                "/opt",
+                "/dev/urandom",
+            ],
+            "read_write": ["/sandbox", "/tmp", "/dev/null"],
+        },
+        "landlock": {"compatibility": "hard_requirement"},
+        "process": {"run_as_user": "1000", "run_as_group": "1000"},
+        "network_policies": {},
+        "network_middlewares": {},
+    }
+
+
+def _absolute_sandbox_path(value: Any) -> PurePosixPath:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or value.startswith("//")
+        or any(ord(char) < 32 or ord(char) == 127 for char in value)
+        or ".." in PurePosixPath(value).parts
+    ):
+        raise ValueError("OpenShell paths must be absolute without traversal")
+    return PurePosixPath(value)
+
+
+class OpenShellConfig(BaseModel):
+    """OpenShell gateway, image, and native sandbox policy for each episode.
+
+    The image must contain the environment and OpenEnv installation. Network
+    policy uses OpenShell's native schema and is validated by OpenShell itself.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
-    cidr: str
-    protocol: Literal["tcp", "udp"]
-    ports: tuple[Annotated[int, Field(strict=True, ge=1, le=65535)], ...] = Field(
-        min_length=1
-    )
+    image: str = Field(min_length=1)
+    gateway: str = Field(min_length=1)
+    workspace: str = "default"
+    python: str = "/usr/local/bin/python3"
+    policy: dict[str, Any] = Field(default_factory=_default_openshell_policy)
 
     @model_validator(mode="after")
-    def validate_rule(self) -> EgressRule:
-        if str(IPv4Network(self.cidr)) != self.cidr:
-            raise ValueError("egress requires a canonical IPv4 CIDR")
+    def validate_isolation(self) -> OpenShellConfig:
+        if self.image.startswith("-") or any(
+            char.isspace() or ord(char) < 32 or ord(char) == 127 for char in self.image
+        ):
+            raise ValueError(
+                "OpenShell image must be a single container image reference"
+            )
+        for name in ("gateway", "workspace"):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", getattr(self, name)):
+                raise ValueError(f"OpenShell {name} must be a nonempty identifier")
+        landlock = self.policy.get("landlock")
+        if not isinstance(landlock, dict) or landlock.get("compatibility") != (
+            "hard_requirement"
+        ):
+            raise ValueError("OpenShell requires Landlock hard_requirement")
+        process = self.policy.get("process")
+        if not isinstance(process, dict):
+            raise ValueError("OpenShell requires an explicit non-root process identity")
+        for name in ("run_as_user", "run_as_group"):
+            value = process.get(name)
+            if (
+                not isinstance(value, str)
+                or not re.fullmatch(r"[0-9]+", value)
+                or int(value) == 0
+            ):
+                raise ValueError(f"OpenShell {name} must be a positive numeric ID")
+        filesystem = self.policy.get("filesystem_policy")
+        if (
+            not isinstance(filesystem, dict)
+            or filesystem.get("include_workdir") is not False
+        ):
+            raise ValueError(
+                "OpenShell filesystem_policy requires include_workdir=false"
+            )
+        read_write = filesystem.get("read_write")
+        if not isinstance(read_write, list):
+            raise ValueError("OpenShell filesystem_policy.read_write must be a list")
+        python = _absolute_sandbox_path(self.python)
+        for value in read_write:
+            path = _absolute_sandbox_path(value)
+            if not (
+                path.is_relative_to("/sandbox")
+                or path.is_relative_to("/tmp")
+                or path == PurePosixPath("/dev/null")
+            ):
+                raise ValueError(
+                    "OpenShell writable paths must stay within /sandbox or /tmp, "
+                    "or be /dev/null"
+                )
+            if python.is_relative_to(path):
+                raise ValueError("OpenShell Python interpreter must not be writable")
         return self
-
-
-class EgressPolicy(BaseModel):
-    """Default-deny egress policy for the workload's kernel network."""
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-    allow: tuple[EgressRule, ...] = ()
 
 
 class OpenEnvDConfig(BaseModel):
@@ -133,7 +214,7 @@ class OpenEnvDConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
     enabled: bool = False
-    network: EgressPolicy = Field(default_factory=EgressPolicy)
+    openshell: OpenShellConfig | None = None
     surfaces: dict[Principal, SurfacePolicy] = Field(default_factory=dict)
     privileged_assets: dict[str, str] = Field(default_factory=dict)
 

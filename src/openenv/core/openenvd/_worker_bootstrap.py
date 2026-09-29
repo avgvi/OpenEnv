@@ -1,24 +1,25 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""Environment worker entrypoint: seal the process before untrusted imports.
+"""Protect the SSH control stream before importing environment code.
 
 The kernel resets the dumpable attribute at every execve (fs/exec.c
 ``setup_new_exec``): when real and effective credentials match, it becomes
 SUID_DUMP_USER regardless of any earlier ``prctl(PR_SET_DUMPABLE, 0)``. The
 seal therefore has to happen in the worker's own address space, and it must
 run before third-party imports, which otherwise leave a long dumpable window
-in which a same-UID principal could steal the inherited daemon control
-listener with pidfd_getfd (the ptrace family requires a dumpable target).
+in which a same-UID principal could steal the daemon control descriptors
+with pidfd_getfd (the ptrace family requires a dumpable target).
 
-This module is executed directly as a script (``python -S
-_worker_bootstrap.py``), so no ``openenv`` package import happens before the
-seal; ``-S`` defers site initialization until after it.
+OpenShell executes this source as ``python -I -S -c <source>`` over SSH without
+a PTY. The first input line supplies factory, action_class, and agent_policy;
+subsequent lines contain requests. ``-I -S`` keeps environment paths and site
+hooks from running before the control descriptors and process are protected.
 """
 
 from __future__ import annotations
 
 import ctypes
+import importlib
 import os
-import runpy
 import site
 import sys
 
@@ -36,20 +37,31 @@ def seal_process() -> None:
         raise OSError(code, os.strerror(code))
 
 
+def protect_stdio() -> tuple[int, int]:
+    """Keep control pipes private; ordinary input is EOF and output is diagnostics."""
+    control_read = os.dup(0)
+    control_write = os.dup(1)
+    os.set_inheritable(control_read, False)
+    os.set_inheritable(control_write, False)
+    null = os.open(os.devnull, os.O_RDONLY)
+    try:
+        os.dup2(null, 0)
+        os.dup2(2, 1)
+    finally:
+        os.close(null)
+    return control_read, control_write
+
+
 def main() -> None:
     seal_process()
-    # Restore the sys.path setup that -S skipped, now that the process is sealed.
+    control_read, control_write = protect_stdio()
+    # Site hooks and all later imports see safe standard descriptors. The worker
+    # owns the private duplicates; subprocesses cannot inherit them even when
+    # launched with close_fds=False.
     site.main()
-    # This script's own directory is not a package root; remove it so its
-    # modules cannot shadow real dependencies during the worker import.
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path[:] = [
-        entry
-        for entry in sys.path
-        if os.path.abspath(entry or os.getcwd()) != script_dir
-    ]
-    sys.argv[0] = WORKER_MODULE
-    runpy.run_module(WORKER_MODULE, run_name="__main__")
+    sys.argv[:] = [WORKER_MODULE]
+    worker = importlib.import_module(WORKER_MODULE)
+    worker.main(control_read, control_write)
 
 
 if __name__ == "__main__":

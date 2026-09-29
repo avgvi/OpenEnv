@@ -132,57 +132,6 @@
       "title": "CheckStatus",
       "type": "string"
     },
-    "EgressPolicy": {
-      "additionalProperties": false,
-      "description": "Default-deny egress policy for the workload's kernel network.",
-      "properties": {
-        "allow": {
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/EgressRule"
-          },
-          "title": "Allow",
-          "type": "array"
-        }
-      },
-      "title": "EgressPolicy",
-      "type": "object"
-    },
-    "EgressRule": {
-      "additionalProperties": false,
-      "description": "Explicit IPv4 destination, protocol, and ports; special ranges stay denied.",
-      "properties": {
-        "cidr": {
-          "title": "Cidr",
-          "type": "string"
-        },
-        "ports": {
-          "items": {
-            "maximum": 65535,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "minItems": 1,
-          "title": "Ports",
-          "type": "array"
-        },
-        "protocol": {
-          "enum": [
-            "tcp",
-            "udp"
-          ],
-          "title": "Protocol",
-          "type": "string"
-        }
-      },
-      "required": [
-        "cidr",
-        "protocol",
-        "ports"
-      ],
-      "title": "EgressRule",
-      "type": "object"
-    },
     "ExecutionDeclaration": {
       "additionalProperties": false,
       "description": "Author-declared runtime binding, introduced by manifest schema 2.\n\nAll paths are portable package-relative paths. Resolving the probe or build\ncontext must additionally reject symlink escapes before reading source files.\nThe data-only probe supplies actions; it cannot change declared capabilities.\n\nAttributes:\n    kind (`str`):\n        The implemented transport binding, `\"openenv_ws\"`.\n    probe_path (`str`):\n        JSON file containing the versioned runtime plan.\n    dockerfile (`str`):\n        Dockerfile relative to the package root.\n    context (`str`):\n        Build context relative to the package root.\n    agent_boundary (`str`):\n        The access granted to an agent; currently only API access is supported.",
@@ -463,8 +412,16 @@
           "title": "Enabled",
           "type": "boolean"
         },
-        "network": {
-          "$ref": "#/$defs/EgressPolicy"
+        "openshell": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpenShellConfig"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "privileged_assets": {
           "additionalProperties": {
@@ -485,6 +442,43 @@
         }
       },
       "title": "OpenEnvDConfig",
+      "type": "object"
+    },
+    "OpenShellConfig": {
+      "additionalProperties": false,
+      "description": "OpenShell gateway, image, and native sandbox policy for each episode.\n\nThe image must contain the environment and OpenEnv installation. Network\npolicy uses OpenShell's native schema and is validated by OpenShell itself.",
+      "properties": {
+        "gateway": {
+          "minLength": 1,
+          "title": "Gateway",
+          "type": "string"
+        },
+        "image": {
+          "minLength": 1,
+          "title": "Image",
+          "type": "string"
+        },
+        "policy": {
+          "additionalProperties": true,
+          "title": "Policy",
+          "type": "object"
+        },
+        "python": {
+          "default": "/usr/local/bin/python3",
+          "title": "Python",
+          "type": "string"
+        },
+        "workspace": {
+          "default": "default",
+          "title": "Workspace",
+          "type": "string"
+        }
+      },
+      "required": [
+        "image",
+        "gateway"
+      ],
+      "title": "OpenShellConfig",
       "type": "object"
     },
     "OracleDeclaration": {

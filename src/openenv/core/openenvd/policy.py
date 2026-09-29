@@ -2,20 +2,18 @@
 """Public compatibility imports for declarative openenvd policies."""
 
 from ..._openenvd_config import (
-    EgressPolicy,
-    EgressRule,
     load_config,
     ObservationEventType,
     OpenEnvDConfig,
+    OpenShellConfig,
     Principal,
     SurfacePolicy,
 )
 
 __all__ = [
-    "EgressRule",
-    "EgressPolicy",
     "ObservationEventType",
     "OpenEnvDConfig",
+    "OpenShellConfig",
     "Principal",
     "SurfacePolicy",
     "load_config",

@@ -1,36 +1,32 @@
 # SPDX-License-Identifier: BSD-3-Clause
-"""One isolated environment process and one trajectory per daemon."""
+"""Episode coordination around an OpenShell-owned sandbox."""
 
 from __future__ import annotations
 
 import asyncio
-import ctypes
 import json
 import os
 import shutil
 import signal
-import socket
 import stat
-import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
-from .cgroup import WorkloadCgroup
-from .isolation import detect_capabilities, IsolationError, spawn_task
-from .models import TaskSpec
-from .network import Network
+from .isolation import IsolationError
 from .observation import Collector, snapshot_changes, Workspace
+from .openshell import OpenShellSandbox
 from .policy import ObservationEventType, OpenEnvDConfig, Principal
-from .telemetry import resource_sample
 
 
 class Runtime:
-    """Own an isolated worker, its episode workspace, and privileged assets.
+    """Keep principal surfaces and assets outside an OpenShell workload sandbox.
 
-    The environment factory is trusted framework code. Untrusted subprocesses
-    stay inside its network namespace and receive no daemon credentials. Linux
-    root and network namespace capability are required; startup fails closed.
+    The local workspace is a seed, never a host mount. Each episode receives a
+    new sandbox and a copy of that seed. Grading operates on downloaded snapshots;
+    oracles run in a separate OpenShell sandbox with private assets. Their
+    changes are not copied back into the running workload.
     """
 
     def __init__(
@@ -40,314 +36,185 @@ class Runtime:
         action_class: str,
         workspace: Path,
         *,
-        uid: int,
-        gid: int,
         asset_root: Path,
         timeout_s: float = 300,
-        cgroup_root: Path = Path("/sys/fs/cgroup"),
-        python_path: Path | None = None,
     ):
         if not config.enabled:
             raise ValueError("openenvd is not enabled")
-        if uid <= 0 or gid <= 0 or timeout_s <= 0:
-            raise ValueError("positive worker identity and timeout are required")
+        if config.openshell is None:
+            raise ValueError("openenvd requires an openshell image and gateway")
+        if timeout_s <= 0 or not float(timeout_s) < float("inf"):
+            raise ValueError("a finite positive timeout is required")
         self.config = OpenEnvDConfig.model_validate(config.model_dump())
-        self.python_path = python_path
-        self.factory = factory
-        self.action_class = action_class
+        observer = self.config.surfaces.get(Principal.OBSERVER)
+        if observer and set(observer.stream) & {"network", "resource"}:
+            raise ValueError(
+                "OpenShell network/resource telemetry is not yet available through "
+                "the observer surface; remove these streams"
+            )
+        self.factory, self.action_class = factory, action_class
         self.workspace_path = workspace.resolve(strict=True)
         self.asset_root = asset_root.resolve(strict=True)
-        self.uid, self.gid = uid, gid
         self.timeout_s = timeout_s
         self.collector = Collector()
+        self.backend = OpenShellSandbox(self.config.openshell, timeout_s=timeout_s)
         self.proc = None
         self.directory = None
         self.workspace = None
         self.assets = {}
+        self.grader_backend = None
+        self.grader_directory = None
+        self._snapshot_valid = False
         self.lock = asyncio.Lock()
         self.monitor = None
-        self.cgroup = WorkloadCgroup(cgroup_root)
-        self.network = None
-        self.network_monitor = None
-        self.started_at = 0.0
         self.event_task = None
+        self.stderr_task = None
+        self.pending = None
+        self.teardown = None
+        self.started_at = 0.0
         self._closed = False
 
     async def start(self):
         if self._closed or self.directory is not None:
             raise RuntimeError("runtime is already started or closed")
-        self.capabilities = detect_capabilities()
-        if (
-            sys.platform != "linux"
-            or not self.capabilities.can_drop_uid
-            or not self.capabilities.can_unshare_net
-        ):
-            raise IsolationError(
-                "openenvd runtime requires Linux UID and network namespace isolation"
-            )
-        parent = self.workspace_path.parent.stat()
-        if parent.st_uid != os.geteuid() or parent.st_mode & 0o022:
-            raise IsolationError(
-                "workspace parent must be daemon-owned and not writable by other identities"
-            )
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
-            raise IsolationError("could not enable orphan process reaping")
-        self.cgroup.create()
+        self._validate_seed()
         self.directory = Path(tempfile.mkdtemp(prefix="openenvd-"))
-        os.chmod(self.directory, 0o700)
+        self.directory.chmod(0o700)
         try:
             assets = self.directory / "assets"
             assets.mkdir(mode=0o700)
             for name, relative in self.config.privileged_assets.items():
                 source = (self.asset_root / relative).resolve(strict=True)
-                if not source.is_relative_to(self.asset_root) or source.is_relative_to(
-                    self.workspace_path
-                ):
-                    raise ValueError(
-                        "privileged asset sources must be outside the workload workspace"
-                    )
-                # Source copies must also be inaccessible to the workload.
-                # Require a daemon-owned 0700 source root instead of leaving an
-                # unprotected original behind after copying.
-                info = self.asset_root.stat()
-                if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
-                    raise ValueError("asset_root must be daemon-owned with mode 0700")
-                target = assets / name
+                if not source.is_relative_to(self.asset_root):
+                    raise ValueError("privileged asset escapes asset_root")
                 if source.is_dir():
-                    shutil.copytree(source, target, symlinks=True)
+                    shutil.copytree(source, assets / name, symlinks=True)
                 else:
-                    shutil.copy2(source, target)
-                self.assets[name] = target
-            self.workspace = Workspace(self.workspace_path, self.directory / "snapshot")
+                    shutil.copy2(source, assets / name)
+                self.assets[name] = assets / name
+            seed_parent = self.directory / "seed"
+            seed_parent.mkdir(mode=0o700)
+            self.workspace = Workspace(self.workspace_path, seed_parent / "workspace")
             self.workspace.capture()
+            # The seed and asset copies stay daemon-owned. Only the seed is uploaded.
             await self._spawn()
             self.monitor = asyncio.create_task(self._monitor())
         except BaseException:
             await self.close()
             raise
 
-    async def _spawn(self):
-        self.started_at = time.monotonic()
-        observer = self.config.surfaces.get(Principal.OBSERVER)
-        self.network = Network(
-            self.config.network,
-            self.collector,
-            observe=bool(observer and "network" in observer.stream),
-        )
-        await self.network.start()
-        await self.network.wait_ready()
-        path = self.directory / "worker.sock"
-        path.unlink(missing_ok=True)
-        sock = socket.socket(socket.AF_UNIX)
-        event_read, event_write = os.pipe()
-        try:
-            reader = asyncio.StreamReader(limit=65536)
-            protocol = asyncio.StreamReaderProtocol(reader)
-            await asyncio.get_running_loop().connect_read_pipe(
-                lambda: protocol, os.fdopen(event_read, "rb")
-            )
-            self.event_task = asyncio.create_task(self._read_events(reader))
-            sock.bind(str(path))
-            sock.listen(16)
-            spec = TaskSpec(
-                name="workload",
-                argv=[
-                    sys.executable,
-                    # The bootstrap seals the worker (PR_SET_DUMPABLE) before
-                    # any package import; -S defers site setup until sealed.
-                    "-S",
-                    str(Path(__file__).with_name("_worker_bootstrap.py")),
-                    str(sock.fileno()),
-                    self.factory,
-                    self.action_class,
-                ],
-                cwd=str(self.workspace_path),
-                uid=self.uid,
-                gid=self.gid,
-                network_isolated=True,
-            )
-            self.proc = await spawn_task(
-                spec,
-                self.capabilities,
-                env={
-                    "PATH": os.defpath,
-                    "OPENENVD_EVENT_FD": str(event_write),
-                    "OPENENVD_AGENT_POLICY": self.config.surfaces.get(
-                        Principal.AGENT
-                    ).model_dump_json()
-                    if Principal.AGENT in self.config.surfaces
-                    else "",
-                    **(
-                        {"PYTHONPATH": str(self.python_path)}
-                        if self.python_path
-                        else {}
-                    ),
-                },
-                pass_fds=(sock.fileno(), event_write),
-                cgroup_path=str(self.cgroup.path),
-                network_namespace=self.network.namespace,
-            )
-        finally:
-            sock.close()
-            os.close(event_write)
-        self.network_monitor = asyncio.create_task(self._watch_network())
-        self.collector.record(
-            ObservationEventType.PROCESS, {"kind": "spawn", "pid": self.proc.pid}
-        )
-        # A roundtrip establishes readiness after environment imports complete.
-        await self._request("ready")
-
-    async def _watch_network(self):
-        await self.network.failed.wait()
-        async with self.lock:
-            try:
-                self.collector.record(
-                    ObservationEventType.NETWORK,
-                    {
-                        "kind": "failure",
-                        "reason": "network mediation or observation failed",
-                    },
-                )
-            finally:
-                await self._stop()
-
-    async def _read_events(self, reader):
-        try:
-            while line := await reader.readline():
-                try:
-                    data = json.loads(line)
-                except (ValueError, UnicodeDecodeError):
-                    continue
-                if isinstance(data, dict):
-                    self.collector.record(
-                        ObservationEventType.HARNESS_EVENT,
-                        {"source": "workload", "event": data},
+    def _validate_seed(self):
+        if not self.workspace_path.is_dir() or self.workspace_path == Path("/"):
+            raise ValueError("workspace must be a dedicated directory")
+        if self.config.privileged_assets and (
+            self.asset_root.is_relative_to(self.workspace_path)
+            or self.workspace_path.is_relative_to(self.asset_root)
+        ):
+            raise ValueError("privileged assets and workspace must have separate roots")
+        for root, dirs, files in os.walk(self.workspace_path, followlinks=False):
+            for name in dirs + files:
+                mode = (Path(root) / name).lstat().st_mode
+                if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                    raise ValueError(
+                        "workspace seed may contain only regular files and directories"
                     )
-        except Exception:
-            # An invalid or overflowing stream cannot silently disable collection.
-            async with self.lock:
-                await self._stop()
 
-    async def stop(self):
-        """Stop the episode while serializing against reset and oracle execution."""
-        async with self.lock:
-            await self._stop()
-
-    async def _stop(self):
-        if self.network_monitor and self.network_monitor is not asyncio.current_task():
-            self.network_monitor.cancel()
-            await asyncio.gather(self.network_monitor, return_exceptions=True)
-        self.network_monitor = None
-        network_error = None
-        if self.network:
-            try:
-                await self.network.close()
-                self.network = None
-            except Exception as error:
-                network_error = error
-        if self.proc is None:
-            if self.event_task:
-                self.event_task.cancel()
-                await asyncio.gather(self.event_task, return_exceptions=True)
-                self.event_task = None
-            if network_error:
-                raise network_error
-            return
-        proc = self.proc
-        try:
-            os.killpg(proc.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            await asyncio.wait_for(proc.wait(), 2)
-        except asyncio.TimeoutError:
-            pass
-        await self.cgroup.kill()
-        await proc.wait()
-        self.proc = None
-        self._reap_orphans()
-        if self.event_task and self.event_task is not asyncio.current_task():
-            self.event_task.cancel()
-            await asyncio.gather(self.event_task, return_exceptions=True)
-            self.event_task = None
+    async def _spawn(self):
+        await self.backend.start(self.workspace.snapshot, self.directory)
+        bootstrap = Path(__file__).with_name("_worker_bootstrap.py").read_text()
+        self.proc = await self.backend.spawn(
+            [self.config.openshell.python, "-I", "-S", "-c", bootstrap],
+            self._workload_env(),
+        )
+        self.started_at = time.monotonic()
+        self.event_task = asyncio.create_task(self._read_frames())
+        self.stderr_task = asyncio.create_task(self._drain_stderr())
+        policy = self.config.surfaces.get(Principal.AGENT)
+        await self._exchange(
+            {
+                "factory": self.factory,
+                "action_class": self.action_class,
+                "agent_policy": policy.model_dump(mode="json") if policy else None,
+            }
+        )
         self.collector.record(
             ObservationEventType.PROCESS,
-            {"kind": "exit", "pid": proc.pid, "returncode": proc.returncode},
+            {"kind": "spawn", "sandbox_id": self.backend.id},
         )
-        if network_error:
-            raise network_error
 
-    def _reap_orphans(self):
-        children = Path(f"/proc/self/task/{os.getpid()}/children")
-        if not children.exists():
-            return
-        managed = {self.proc.pid if self.proc else None}
-        if self.network and self.network.process:
-            managed.add(self.network.process.pid)
-        for child in children.read_text().split():
-            pid = int(child)
-            if pid not in managed:
-                try:
-                    os.waitpid(pid, os.WNOHANG)
-                except ChildProcessError:
-                    pass
+    def _workload_env(self):
+        return {
+            "PATH": str(Path(self.config.openshell.python).parent) + ":/usr/bin:/bin",
+            "HOME": "/sandbox",
+            "TMPDIR": "/tmp",
+        }
+
+    async def _drain_stderr(self):
+        # Environment logs may contain user data. Drain without retaining or
+        # copying them into API errors, and without allowing a full pipe to hang.
+        while await self.proc.stderr.read(65536):
+            pass
+
+    async def _read_frames(self):
+        try:
+            while line := await self.proc.stdout.readline():
+                frame = json.loads(line)
+                if not isinstance(frame, dict):
+                    raise IsolationError("invalid worker response")
+                if set(frame) == {"event"} and isinstance(frame["event"], dict):
+                    self.collector.record(
+                        ObservationEventType.HARNESS_EVENT,
+                        {"source": "workload", "event": frame["event"]},
+                    )
+                elif set(frame) in ({"result"}, {"error"}) and self.pending is not None:
+                    if self.pending.done():
+                        raise IsolationError("unexpected worker response")
+                    self.pending.set_result(frame)
+                else:
+                    raise IsolationError("unexpected worker response")
+            raise IsolationError("OpenShell worker disconnected")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if self.pending is not None and not self.pending.done():
+                self.pending.set_exception(
+                    IsolationError("OpenShell worker disconnected or sent invalid data")
+                )
+            # The monitor notices completion and tears down the complete sandbox.
+
+    async def _exchange(self, payload):
+        future = asyncio.get_running_loop().create_future()
+        self.pending = future
+        try:
+            if self.event_task.done():
+                raise IsolationError("OpenShell worker disconnected")
+            self.proc.stdin.write(json.dumps(payload).encode() + b"\n")
+            await asyncio.wait_for(self.proc.stdin.drain(), self.timeout_s)
+            response = await asyncio.wait_for(future, self.timeout_s)
+            if "error" in response:
+                raise RuntimeError("environment operation failed")
+            return response["result"]
+        finally:
+            self.pending = None
+            if not future.done():
+                future.cancel()
 
     async def _request(self, operation: str, data: dict | None = None):
-        async def exchange():
-            reader, writer = await asyncio.open_unix_connection(
-                str(self.directory / "worker.sock"), limit=16 * 1024 * 1024
-            )
-            try:
-                writer.write(
-                    json.dumps({"operation": operation, "data": data or {}}).encode()
-                    + b"\n"
-                )
-                await writer.drain()
-                line = await reader.readline()
-                if not line:
-                    raise RuntimeError("environment worker disconnected")
-                result = json.loads(line)
-                if "error" in result:
-                    raise RuntimeError(result["error"])
-                return result["result"]
-            finally:
-                writer.close()
-                await writer.wait_closed()
-
-        async def supervised_exchange():
-            network = self.network
-            if network is None:
-                return await exchange()
-            operation = asyncio.create_task(exchange())
-            failure = asyncio.create_task(network.failed.wait())
-            try:
-                await asyncio.wait(
-                    (operation, failure), return_when=asyncio.FIRST_COMPLETED
-                )
-                network.check()
-                return await operation
-            finally:
-                operation.cancel()
-                failure.cancel()
-                await asyncio.gather(operation, failure, return_exceptions=True)
-
-        return await asyncio.wait_for(supervised_exchange(), self.timeout_s)
+        return await self._exchange({"operation": operation, "data": data or {}})
 
     async def request(self, operation: str, data: dict | None = None):
         async with self.lock:
             if self._closed or self.proc is None or self.proc.returncode is not None:
                 raise RuntimeError("workload exited; reset is required")
-            if self.network:
-                try:
-                    self.network.check()
-                except IsolationError:
-                    await self._stop()
-                    raise
             try:
                 result = await self._request(operation, data)
-            except (asyncio.TimeoutError, asyncio.CancelledError, IsolationError):
-                await self._stop()
+            except (
+                asyncio.TimeoutError,
+                asyncio.CancelledError,
+                IsolationError,
+                OSError,
+            ):
+                await self._stop(capture=False)
                 raise
             if operation == "step" or (
                 operation == "mcp" and data and data.get("method") == "tools/call"
@@ -363,13 +230,99 @@ class Runtime:
                 )
             return result
 
+    async def _sync_workspace(self):
+        self._snapshot_valid = False
+        staging = Path(tempfile.mkdtemp(prefix="view-", dir=self.directory))
+        try:
+            await self.backend.download(staging)
+        except BaseException:
+            self._remove_private_tree(staging)
+            raise
+        previous = self.workspace.path
+        self.workspace.path = staging
+        self._snapshot_valid = True
+        if previous != self.workspace_path and previous.is_relative_to(self.directory):
+            self._remove_private_tree(previous)
+
+    @staticmethod
+    def _remove_private_tree(path):
+        # Snapshots preserve workload modes, including read-only directories.
+        # Repair only the private copy, never a symlink target or the seed.
+        if path.is_symlink():
+            path.unlink()
+            return
+        path.chmod(0o700)
+        for root, directories, _ in os.walk(path, followlinks=False):
+            for name in directories:
+                directory = Path(root) / name
+                if not directory.is_symlink():
+                    directory.chmod(0o700)
+        shutil.rmtree(path)
+
+    async def stop(self):
+        async with self.lock:
+            await self._stop()
+
+    async def _stop(self, *, capture=True):
+        # Keep cleanup owned even if the request/connection that initiated it is
+        # cancelled. Subsequent reset/close calls await the same teardown first.
+        if self.teardown is None or self.teardown.done():
+            self.teardown = asyncio.create_task(self._teardown(capture=capture))
+        try:
+            await asyncio.shield(self.teardown)
+        except asyncio.CancelledError:
+            await asyncio.shield(self.teardown)
+            raise
+
+    async def _teardown(self, *, capture):
+        capture_error = None
+        if not capture:
+            self._snapshot_valid = False
+        try:
+            await self._close_grader()
+        except Exception as error:
+            capture_error = error
+        if capture and self.backend.id and self.workspace is not None:
+            try:
+                await self._sync_workspace()
+            except Exception as error:
+                capture_error = error
+        # Only confirmed sandbox deletion permits another episode. Killing the
+        # local SSH client by itself does not prove remote descendant cleanup.
+        await self.backend.close()
+        proc = self.proc
+        if proc is not None:
+            if proc.returncode is None:
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+            self.proc = None
+            self.collector.record(
+                ObservationEventType.PROCESS,
+                {"kind": "exit", "returncode": proc.returncode},
+            )
+        for task in (self.event_task, self.stderr_task):
+            if task and task is not asyncio.current_task():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.event_task = self.stderr_task = None
+        if capture_error:
+            raise IsolationError(
+                "workspace snapshot failed before sandbox teardown"
+            ) from capture_error
+
     async def reset(self, data: dict):
         async with self.lock:
             if self._closed:
                 raise RuntimeError("runtime is closed")
-            await self._stop()
-            await asyncio.to_thread(self.workspace.restore)
+            await self._stop(capture=False)
             self.collector = Collector()
+            self.backend = OpenShellSandbox(
+                self.config.openshell, timeout_s=self.timeout_s
+            )
             try:
                 await self._spawn()
                 result = await self._request("reset", data)
@@ -377,7 +330,7 @@ class Runtime:
                     self.monitor = asyncio.create_task(self._monitor())
                 return result
             except BaseException:
-                await self._stop()
+                await self._stop(capture=False)
                 raise
 
     async def _monitor(self):
@@ -387,80 +340,55 @@ class Runtime:
             raise
         except Exception:
             async with self.lock:
-                await self._stop()
+                await self._stop(capture=False)
 
     async def _observe_loop(self):
         observer = self.config.surfaces.get(Principal.OBSERVER)
-        streams = set(observer.stream) if observer else set()
-        previous = (
-            await asyncio.to_thread(lambda: self.workspace.baseline)
-            if "fs_diff" in streams
-            else {}
-        )
+        watch_files = bool(observer and "fs_diff" in observer.stream)
+        previous = self.workspace.baseline if watch_files else {}
         previous_collector = self.collector
-        processes = set()
         while True:
             await asyncio.sleep(1)
             async with self.lock:
-                if self.proc and time.monotonic() - self.started_at >= self.timeout_s:
-                    await self._stop()
-                self._reap_orphans()
-                if self.network:
-                    self.network.check()
-                if self.proc and self.proc.returncode is not None:
-                    await self._stop()
-                collector = self.collector
-
-            # File hashing must not hold up actions or resets. A reset replaces
-            # the collector, so discard any sample taken across that boundary.
-            try:
-                current = (
-                    await asyncio.to_thread(self.workspace.scan)
-                    if "fs_diff" in streams
-                    else None
-                )
-                resources = None
-                if "resource" in streams:
-                    resources = {
-                        **resource_sample(self.cgroup.path),
-                        "disk_bytes": await asyncio.to_thread(
-                            self.workspace.disk_usage
-                        ),
-                    }
-            except Exception:
-                async with self.lock:
-                    if collector is not self.collector:
-                        continue
-                    await self._stop()
-                return
-            async with self.lock:
-                if collector is not self.collector:
+                if self.proc is None:
                     continue
-                if collector is not previous_collector:
-                    previous = self.workspace.baseline if "fs_diff" in streams else {}
-                    processes = set()
-                    previous_collector = collector
-                if current is not None:
-                    for change in snapshot_changes(previous, current):
-                        collector.record(ObservationEventType.FS_CHANGE, change)
-                    previous = current
-                if resources is not None:
-                    collector.record(ObservationEventType.RESOURCE, resources)
-                if "process" in streams:
-                    current_processes = set(
-                        (self.cgroup.path / "cgroup.procs").read_text().split()
-                    )
-                    for pid in sorted(processes ^ current_processes):
-                        collector.record(
-                            ObservationEventType.PROCESS,
-                            {
-                                "pid": int(pid),
-                                "kind": "spawn" if pid in current_processes else "exit",
-                            },
-                        )
-                    processes = current_processes
+                if (
+                    self.proc.returncode is not None
+                    or self.event_task.done()
+                    or time.monotonic() - self.started_at >= self.timeout_s
+                ):
+                    await self._stop(capture=False)
+                    return
+                if not watch_files:
+                    continue
+                if self.collector is not previous_collector:
+                    previous = self.workspace.baseline
+                    previous_collector = self.collector
+                await self._sync_workspace()
+                current = await asyncio.to_thread(self.workspace.scan)
+                for change in snapshot_changes(previous, current):
+                    self.collector.record(ObservationEventType.FS_CHANGE, change)
+                previous = current
 
-    def read_file(self, path: str) -> str:
+    async def _refresh_snapshot(self):
+        if self.backend.id:
+            await self._sync_workspace()
+        elif not self._snapshot_valid:
+            raise RuntimeError(
+                "workspace snapshot unavailable after forced teardown; reset required"
+            )
+
+    async def fs_diff(self):
+        async with self.lock:
+            await self._refresh_snapshot()
+            return [
+                {**change, "path": str(Path("/workspace") / change["path"])}
+                for change in snapshot_changes(
+                    self.workspace.baseline, self.workspace.scan()
+                )
+            ]
+
+    async def read_file(self, path: str) -> str:
         policy = self.config.surfaces[Principal.GRADER]
         logical = Path(path)
         if (
@@ -469,16 +397,20 @@ class Runtime:
             or not policy.permits_read(logical)
         ):
             raise PermissionError("path is not permitted")
-        if logical.is_relative_to("/openenvd/assets"):
-            relative = logical.relative_to("/openenvd/assets")
-            root = self.directory / "assets"
-        elif logical.is_relative_to(self.workspace_path):
-            relative = logical.relative_to(self.workspace_path)
-            root = self.workspace_path
-        else:
-            raise PermissionError("path is outside managed roots")
-        # Walk descriptors with O_NOFOLLOW, including ancestors, to avoid symlink
-        # and rename races against a concurrently running workload.
+        async with self.lock:
+            if logical.is_relative_to("/openenvd/assets"):
+                relative = logical.relative_to("/openenvd/assets")
+                root = self.directory / "assets"
+            elif logical.is_relative_to("/workspace"):
+                await self._refresh_snapshot()
+                relative = logical.relative_to("/workspace")
+                root = self.workspace.path
+            else:
+                raise PermissionError("path is outside managed roots")
+            return await asyncio.to_thread(self._read_regular_file, root, relative)
+
+    @staticmethod
+    def _read_regular_file(root, relative):
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
             for index, part in enumerate(relative.parts):
@@ -498,42 +430,72 @@ class Runtime:
         finally:
             os.close(fd)
 
+    async def _close_grader(self):
+        if self.grader_backend is None:
+            return
+        await self.grader_backend.close()
+        self.grader_backend = None
+        self._remove_private_tree(self.grader_directory)
+        self.grader_directory = None
+
     async def run_oracle(self):
         async with self.lock:
-            return await self._run_oracle()
+            policy = self.config.surfaces[Principal.GRADER]
+            if not policy.allow_privileged_exec or "oracle" not in self.assets:
+                raise PermissionError("oracle execution is not permitted")
+            await self._close_grader()
+            await self._refresh_snapshot()
+            directory = Path(tempfile.mkdtemp(prefix="grader-", dir=self.directory))
+            self.grader_directory = directory
+            self.grader_backend = OpenShellSandbox(
+                self.config.openshell, timeout_s=self.timeout_s
+            )
+            try:
+                seed = directory / "workspace"
+                shutil.copytree(self.workspace.path, seed)
+                seed.chmod(stat.S_IMODE(seed.stat().st_mode) | 0o700)
+                asset_name = ".openenvd-assets-" + uuid.uuid4().hex
+                # Assets enter only this short-lived grading sandbox. No daemon
+                # credentials or grader results enter the agent's sandbox.
+                for name, source in self.assets.items():
+                    target = seed / asset_name / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if source.is_dir():
+                        shutil.copytree(source, target, symlinks=True)
+                    else:
+                        shutil.copy2(source, target)
+                await self.grader_backend.start(seed, directory)
+                proc = await self.grader_backend.spawn(
+                    [f"/sandbox/workspace/{asset_name}/oracle"], self._workload_env()
+                )
+                return await self._oracle_result(proc)
+            finally:
+                cleanup = asyncio.create_task(self._close_grader())
+                try:
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    await asyncio.shield(cleanup)
+                    raise
 
-    async def _run_oracle(self):
-        policy = self.config.surfaces[Principal.GRADER]
-        if not policy.allow_privileged_exec or "oracle" not in self.assets:
-            raise PermissionError("oracle execution is not permitted")
-        # Oracle is trusted operator code; inherit no daemon credentials.
-        proc = await asyncio.create_subprocess_exec(
-            str(self.assets["oracle"]),
-            cwd=self.workspace_path,
-            env={"PATH": os.defpath},
-            stdin=asyncio.subprocess.DEVNULL,
-            umask=0o077,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
+    async def _oracle_result(self, proc):
+        async def read_bounded(stream):
+            chunks, size = [], 0
+            while chunk := await stream.read(65536):
+                size += len(chunk)
+                if size > 1024 * 1024:
+                    raise RuntimeError("oracle output exceeds 1 MiB")
+                chunks.append(chunk)
+            return b"".join(chunks)
+
+        # The oracle receives no interactive control channel.
+        proc.stdin.close()
+        readers = [
+            asyncio.create_task(read_bounded(proc.stdout)),
+            asyncio.create_task(read_bounded(proc.stderr)),
+        ]
         try:
-
-            async def read_bounded(stream):
-                chunks = []
-                size = 0
-                while chunk := await stream.read(65536):
-                    size += len(chunk)
-                    if size > 1024 * 1024:
-                        raise RuntimeError("oracle output exceeds 1 MiB")
-                    chunks.append(chunk)
-                return b"".join(chunks)
-
             stdout, stderr, _ = await asyncio.wait_for(
-                asyncio.gather(
-                    read_bounded(proc.stdout), read_bounded(proc.stderr), proc.wait()
-                ),
-                self.timeout_s,
+                asyncio.gather(*readers, proc.wait()), self.timeout_s
             )
             return {
                 "returncode": proc.returncode,
@@ -541,11 +503,22 @@ class Runtime:
                 "stderr": stderr.decode(errors="replace"),
             }
         finally:
+            for reader in readers:
+                reader.cancel()
+            await asyncio.gather(*readers, return_exceptions=True)
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            await proc.wait()
+
+            async def discard(stream):
+                while await stream.read(65536):
+                    pass
+
+            await asyncio.wait_for(
+                asyncio.gather(discard(proc.stdout), discard(proc.stderr), proc.wait()),
+                5,
+            )
 
     async def close(self):
         self._closed = True
@@ -554,12 +527,7 @@ class Runtime:
             await asyncio.gather(self.monitor, return_exceptions=True)
             self.monitor = None
         async with self.lock:
-            await self._stop()
-        if self.event_task:
-            self.event_task.cancel()
-            await asyncio.gather(self.event_task, return_exceptions=True)
-            self.event_task = None
+            await self._stop(capture=False)
         if self.directory:
-            shutil.rmtree(self.directory)
+            self._remove_private_tree(self.directory)
             self.directory = None
-        self.cgroup.close()
