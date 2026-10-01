@@ -120,7 +120,10 @@ def validate(
     ] = False,
     local: Annotated[
         bool,
-        typer.Option("--local", help="Use Docker-local runtime validation explicitly"),
+        typer.Option(
+            "--local",
+            help="Explicitly select the default local-package mode (incompatible with --url)",
+        ),
     ] = False,
     policy_version: Annotated[
         str | None,

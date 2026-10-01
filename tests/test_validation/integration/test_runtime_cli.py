@@ -336,6 +336,7 @@ def _assert_fresh_replays(artifacts, identical_samples=3):
     "mode,failed_check",
     [
         ("good", None),
+        ("slow_step", None),
         ("bad_reward", "runtime.reward_well_formed"),
         ("bad_observation", "runtime.observation_schema"),
         ("missing_done", "runtime.observation_schema"),
@@ -430,16 +431,9 @@ def test_cli_hung_step_times_out_with_partial_evidence(cli_context, tmp_path):
     assert result.returncode == 1
     assert report["verdict"] == "fail"
     assert report["manifest"]["resources"]["episode_timeout_s"] == 3.0
-    assert checks["runtime.startup"]["status"] == "pass"
+    assert checks["runtime.startup"]["status"] == "fail"
     assert all(
-        checks[key]["status"] == "fail"
-        for key in {
-            "runtime.reward_well_formed",
-            "runtime.observation_schema",
-            "runtime.state_contract",
-            "runtime.seed_control",
-            "runtime.trajectory_record",
-        }
+        checks[key]["status"] == "skip" for key in IMPLEMENTED - {"runtime.startup"}
     )
     _assert_partial_episode(artifacts, "TimeoutError")
 

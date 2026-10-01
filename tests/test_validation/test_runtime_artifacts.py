@@ -454,3 +454,23 @@ def test_discovery_distinguishes_missing_from_null_and_removes_stale_artifact(tm
     write_runtime_bundle(tmp_path, report())
     assert not (tmp_path / "discovery.json").exists()
     assert "discovery.json" not in (tmp_path / "SHA256SUMS").read_text()
+
+
+def test_redaction_preserves_token_metadata_and_filters_secret_keys():
+    from openenv.validation.runtime.artifacts import _redact
+
+    secret = "hf_abcdefghijk123456789"
+    source = {
+        "task_distribution": "task_distribution",
+        "max_tokens": 100,
+        "prompt_token_ids": [1, 2, 3],
+        "access_token": "opaque-credential",
+        secret: {"description": "public"},
+        "nested": {"key": secret},
+    }
+    filtered = _redact(source)
+    assert filtered["task_distribution"] == "task_distribution"
+    assert filtered["max_tokens"] == 100
+    assert filtered["prompt_token_ids"] == [1, 2, 3]
+    assert filtered["access_token"] == "[REDACTED]"
+    assert secret not in json.dumps(filtered)

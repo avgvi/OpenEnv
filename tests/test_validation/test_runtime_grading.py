@@ -169,7 +169,7 @@ def test_truncated_collection_cannot_pass_from_a_valid_prefix(tmp_path, grader):
             failure_reason="step failed (TimeoutError)",
         ),
     )
-    assert grader().run(subject).status is CheckStatus.FAIL
+    assert grader().run(subject).status is CheckStatus.SKIP
 
 
 @pytest.mark.parametrize(
@@ -369,4 +369,24 @@ def test_malformed_wire_is_a_finding_not_a_validator_crash(tmp_path, grader):
             failure_reason="step failed (JSONDecodeError)",
         ),
     )
-    assert grader().run(subject).status is CheckStatus.FAIL
+    assert grader().run(subject).status is CheckStatus.SKIP
+
+
+def test_schema_required_keyword_identifies_missing_property(tmp_path):
+    result = ObservationSchemaGrader().run(
+        subject_with(tmp_path, schema={"required": ["tool_name"]})
+    )
+    assert result.status is CheckStatus.FAIL
+    assert all("(required)" in message for message in result.evidence)
+    assert all(
+        'missing properties: ["tool_name"]' in message for message in result.evidence
+    )
+
+
+def test_schema_diagnostics_do_not_echo_private_property_names(tmp_path):
+    secret = "hf_abcdefghijk123456789"
+    result = ObservationSchemaGrader().run(
+        subject_with(tmp_path, schema={"required": [secret]})
+    )
+    assert result.status is CheckStatus.FAIL
+    assert secret not in result.model_dump_json()

@@ -39,9 +39,18 @@ def main():
             observation = dict(data["observation"])
             observation.update(reward=data["reward"], done=data["done"])
             for error in validator.iter_errors(observation):
-                location = "/".join(str(x) for x in error.absolute_path)[:160]
+                location = "/".join(str(x) for x in error.absolute_schema_path)[:160]
+                missing = ""
+                if error.validator == "required":
+                    names = [
+                        name
+                        for name in error.validator_value
+                        if name not in error.instance
+                    ]
+                    missing = "; missing properties: " + json.dumps(names[:5])[:160]
                 problems.append(
-                    f"exchange {row['index']}: schema mismatch at {location or '/'}"
+                    f"exchange {row['index']}: schema mismatch at {location or '/'} "
+                    f"({error.validator}){missing}"
                 )
                 if len(problems) >= 20:
                     break
