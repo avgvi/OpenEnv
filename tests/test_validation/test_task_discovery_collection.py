@@ -1,5 +1,7 @@
 import json
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import httpx
 import pytest
@@ -19,7 +21,11 @@ def collect(monkeypatch, handler, *, advertised=None, **kwargs):
         return handler(request)
 
     def client(**options):
-        assert options == {"trust_env": False, "follow_redirects": False}
+        assert options["limits"].max_keepalive_connections == 0
+        assert {key: value for key, value in options.items() if key != "limits"} == {
+            "trust_env": False,
+            "follow_redirects": False,
+        }
         return original(transport=httpx.MockTransport(respond), **options)
 
     monkeypatch.setattr(discovery.httpx, "Client", client)
@@ -181,6 +187,74 @@ def test_request_timeout_uses_episode_deadline_unless_explicitly_capped(
     assert error is None and json.loads(payload)["splits"] == []
     assert len(timeouts) == 2
     assert all(set(timeout.values()) == {expected} for timeout in timeouts)
+
+
+@pytest.mark.parametrize("phase", ["headers", "chunk_header"])
+@pytest.mark.parametrize("request_timeout_s", [None, 0.2])
+def test_dripping_task_response_cannot_extend_the_http_deadline(
+    phase, request_timeout_s
+):
+    stopped = threading.Event()
+    paths = []
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            paths.append(self.path)
+            if self.path == "/list_environments":
+                body = b'["probe"]'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            assert self.path == "/probe/splits"
+            self.close_connection = True
+            prefix = (
+                b"HTTP/1.1 200 OK\r\nX-Slow: "
+                if phase == "headers"
+                else b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2;"
+            )
+            suffix = (
+                b"\r\nContent-Length: 2\r\n\r\n[]"
+                if phase == "headers"
+                else b"\r\n[]\r\n0\r\n\r\n"
+            )
+            try:
+                self.connection.sendall(prefix)
+                # Each byte arrives before the inactivity timeout. The full
+                # header or chunk extension still exceeds the request budget.
+                for _ in range(100):
+                    if stopped.wait(0.01):
+                        return
+                    self.connection.sendall(b"x")
+                self.connection.sendall(suffix)
+            except OSError:
+                pass  # The deadline closes the peer's transport mid-response.
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        started = time.monotonic()
+        payload, error = discovery.collect_task_evidence(
+            f"http://127.0.0.1:{server.server_port}",
+            deadline=started + (0.2 if request_timeout_s is None else 5),
+            request_timeout_s=request_timeout_s,
+        )
+        elapsed = time.monotonic() - started
+    finally:
+        stopped.set()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+    assert paths == ["/list_environments", "/probe/splits"]
+    assert payload is None and error == "task discovery failed (TimeoutError)"
+    assert elapsed < 0.75
 
 
 @pytest.mark.parametrize("split,task", [("train", "😀" * 40), ("s" * 200, None)])
