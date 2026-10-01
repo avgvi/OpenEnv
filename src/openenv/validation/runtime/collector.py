@@ -248,6 +248,9 @@ def collect_runtime_evidence(
                 try:
                     parsed = json.loads(raw)
                 except (ValueError, RecursionError):
+                    # Malformed JSON cannot be checked for escaped credentials.
+                    if validation_token:
+                        raise
                     parsed = None
                 if contains_credential(parsed):
                     raise ValueError("response contains validation credentials")

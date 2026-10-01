@@ -17,7 +17,9 @@ def collect(
     *,
     snapshot=None,
     leaked_response=None,
+    leak_operation="reset",
     escaped=False,
+    malformed=False,
     opening_reply=None,
     opening_error=None,
 ):
@@ -62,7 +64,11 @@ def collect(
                 response = {
                     "type": "observation",
                     "data": {
-                        "observation": {"message": leaked_response},
+                        "observation": {
+                            "message": leaked_response
+                            if operation == leak_operation
+                            else None
+                        },
                         "done": False,
                         "reward": 0.0,
                     },
@@ -73,7 +79,7 @@ def collect(
                     leaked_response,
                     "".join(f"\\u{ord(c):04x}" for c in leaked_response),
                 )
-            return raw
+            return raw[:-1] if malformed and operation == leak_operation else raw
 
         def close(self):
             pass
@@ -167,3 +173,21 @@ def test_opening_cancellation_is_not_downgraded_to_optional_telemetry(monkeypatc
     assert error.value.evidence.failure_phase == "validation_open"
     assert not error.value.evidence.exchanges
     assert TOKEN not in repr(error.value.evidence)
+
+
+@pytest.mark.parametrize("credential", [TOKEN, CAPABILITY])
+@pytest.mark.parametrize("operation", ["reset", "step"])
+def test_malformed_wire_cannot_retain_escaped_credentials(
+    monkeypatch, credential, operation
+):
+    result = collect(
+        monkeypatch,
+        leaked_response=credential,
+        leak_operation=operation,
+        escaped=True,
+        malformed=True,
+    )
+    assert [row.operation for row in result.exchanges] == (
+        [] if operation == "reset" else ["reset", "state"]
+    )
+    assert result.failure_reason == f"{operation} failed (JSONDecodeError)"
