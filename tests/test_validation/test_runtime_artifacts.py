@@ -222,3 +222,23 @@ def test_malformed_wire_omission_is_visible_in_metadata(tmp_path):
     assert metadata["omitted_trace_fields"] == [
         {"exchange_index": 0, "field": "response_json"}
     ]
+
+
+def test_redaction_preserves_token_metadata_and_filters_secret_keys():
+    from openenv.validation.runtime.artifacts import _redact
+
+    secret = "hf_abcdefghijk123456789"
+    source = {
+        "task_distribution": "task_distribution",
+        "max_tokens": 100,
+        "prompt_token_ids": [1, 2, 3],
+        "access_token": "opaque-credential",
+        secret: {"description": "public"},
+        "nested": {"key": secret},
+    }
+    filtered = _redact(source)
+    assert filtered["task_distribution"] == "task_distribution"
+    assert filtered["max_tokens"] == 100
+    assert filtered["prompt_token_ids"] == [1, 2, 3]
+    assert filtered["access_token"] == "[REDACTED]"
+    assert secret not in json.dumps(filtered)

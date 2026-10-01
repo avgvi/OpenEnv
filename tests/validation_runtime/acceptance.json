@@ -15,6 +15,7 @@
       "tests.test_validation.integration.test_docker_lifecycle::test_docker_exec_timeout_removes_process_tree",
       "tests.test_validation.integration.test_echo_canary::test_reference_echo_replays_real_tools_and_exposes_contract_findings",
       "tests.test_validation.integration.test_runtime_cli::test_cli_runtime_contract_findings[good-None]",
+      "tests.test_validation.integration.test_runtime_cli::test_cli_runtime_contract_findings[slow_step-None]",
       "tests.test_validation.integration.test_runtime_cli::test_cli_runtime_contract_findings[bad_reward-runtime.reward_well_formed]",
       "tests.test_validation.integration.test_runtime_cli::test_cli_runtime_contract_findings[bad_observation-runtime.observation_schema]",
       "tests.test_validation.integration.test_runtime_cli::test_cli_runtime_contract_findings[missing_done-runtime.observation_schema]",

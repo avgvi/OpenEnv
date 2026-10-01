@@ -9,8 +9,9 @@ from dataclasses import asdict
 from pathlib import Path
 
 _SECRET_KEY = re.compile(r"(?i)(password|secret|token|authorization|api[_-]?key)")
+_TOKEN_METADATA_KEYS = {"max_tokens", "prompt_token_ids"}
 _TOKEN = re.compile(
-    r"(?:hf_[A-Za-z0-9]{8,}|(?:sk|ghp|github_pat)[-_][A-Za-z0-9_-]{8,}|(?i:bearer)\s+\S+)"
+    r"(?<![A-Za-z0-9])(?:hf_[A-Za-z0-9]{8,}|(?:sk|ghp|github_pat)[-_][A-Za-z0-9_-]{8,}|(?i:bearer)\s+\S+)"
 )
 _MAX_ARTIFACT_DEPTH = 64
 
@@ -20,8 +21,8 @@ def _redact(value, *, depth=0):
         return {"omitted": "artifact nesting limit exceeded"}
     if isinstance(value, dict):
         return {
-            key: "[REDACTED]"
-            if _SECRET_KEY.search(key)
+            _TOKEN.sub("[REDACTED]", key): "[REDACTED]"
+            if _SECRET_KEY.search(key) and key not in _TOKEN_METADATA_KEYS
             else _redact(child, depth=depth + 1)
             for key, child in value.items()
         }

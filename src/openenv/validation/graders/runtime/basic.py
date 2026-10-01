@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from ...report import CheckResult
+from ...runtime.artifacts import _redact
 from ...types import CheckStatus, Level
 
 
@@ -44,9 +45,14 @@ class _RuntimeGrader:
                 evidence=["runtime evidence is unavailable"],
                 duration_s=0,
             )
-        if not evidence.failure_reason and not any(
-            row.operation == "step" for row in evidence.exchanges
-        ):
+        if evidence.failure_reason:
+            return CheckResult(
+                check_id=self.check_id,
+                status=CheckStatus.SKIP,
+                evidence=["unmet dependency: runtime.startup (collection incomplete)"],
+                duration_s=0,
+            )
+        if not any(row.operation == "step" for row in evidence.exchanges):
             return CheckResult(
                 check_id=self.check_id,
                 status=CheckStatus.SKIP,
@@ -54,8 +60,6 @@ class _RuntimeGrader:
                 duration_s=0,
             )
         problems = []
-        if evidence.failure_reason:
-            problems.append(evidence.failure_reason)
         try:
             problems.extend(self.check(subject, evidence))
         except (ValueError, TypeError, KeyError, RecursionError, OverflowError):
@@ -169,7 +173,7 @@ class ObservationSchemaGrader(_RuntimeGrader):
                     "observation schema evaluation exceeded its resource budget"
                 )
             else:
-                problems.extend(json.loads(checked.stdout))
+                problems.extend(_redact(json.loads(checked.stdout)))
         except subprocess.TimeoutExpired:
             problems.append("observation schema evaluation exceeded its time budget")
         return problems
