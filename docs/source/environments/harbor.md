@@ -271,7 +271,10 @@ per rollout and trains on each session's validated `TrainingTrace`.
   capture fit together.
 - [The ultimate guide to multi-harness RL](https://huggingface.co/spaces/AdithyaSK/multi-harness-rl):
   one policy trained across OpenCode, Claude Code, Codex and Mini-SWE-Agent through this
-  environment, with its [models, datasets and environments](https://huggingface.co/collections/FineEnvs/smoldataenv-multi-harness-rl).
+  environment. Its runnable code is the
+  [FineEnvs multi-harness tutorial](https://github.com/adithya-s-k/FineEnvs/tree/main/05-multi-harness-rl),
+  and its [models, datasets and environments](https://huggingface.co/collections/FineEnvs/smoldataenv-multi-harness-rl)
+  are in one collection.
 
 ## The web UI
 
