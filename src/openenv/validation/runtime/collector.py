@@ -9,6 +9,7 @@ from urllib.parse import urlsplit, urlunsplit
 import httpx
 from websockets.sync.client import connect
 
+from ...core.env_server.types import WSErrorCode
 from .contracts import RuntimeEvidence, RuntimePlan, WireExchange
 
 MAX_MESSAGE_BYTES = 1024 * 1024
@@ -71,7 +72,7 @@ def collect_runtime_evidence(
     plan: RuntimePlan,
     *,
     episode_timeout_s: float,
-    request_timeout_s: float = 5.0,
+    request_timeout_s: float | None = None,
     validation_token: str | None = None,
 ) -> RuntimeEvidence:
     """
@@ -88,8 +89,9 @@ def collect_runtime_evidence(
             Validated, bounded reset and action inputs.
         episode_timeout_s (`float`):
             Deadline for the complete collection, including schema retrieval.
-        request_timeout_s (`float`, *optional*, defaults to `5.0`):
-            Per-operation deadline, capped by the remaining episode budget.
+        request_timeout_s (`float`, *optional*):
+            Optional per-operation cap. By default, each operation may use the
+            remaining declared episode budget.
         validation_token (`str`, *optional*):
             Run-scoped telemetry authorization; never retained in evidence.
 
@@ -103,9 +105,12 @@ def collect_runtime_evidence(
     trace_bytes = 0
     telemetry_json = None
     telemetry_error = None
+    server_code = None
 
     def remaining() -> float:
-        value = min(request_timeout_s, deadline - time.monotonic())
+        value = deadline - time.monotonic()
+        if request_timeout_s is not None:
+            value = min(request_timeout_s, value)
         if value <= 0:
             raise TimeoutError("episode deadline exceeded")
         return value
@@ -222,7 +227,7 @@ def collect_runtime_evidence(
                 return False
 
             def exchange(operation: str, data: dict | None = None) -> dict:
-                nonlocal phase, trace_bytes
+                nonlocal phase, trace_bytes, server_code
                 phase = operation
                 request = {"type": operation}
                 if data is not None:
@@ -248,6 +253,9 @@ def collect_runtime_evidence(
                 try:
                     parsed = json.loads(raw)
                 except (ValueError, RecursionError):
+                    # Malformed JSON cannot be checked for escaped credentials.
+                    if validation_token:
+                        raise
                     parsed = None
                 if contains_credential(parsed):
                     raise ValueError("response contains validation credentials")
@@ -259,6 +267,16 @@ def collect_runtime_evidence(
                     )
                 )
                 response = json.loads(raw)
+                if isinstance(response, dict) and response.get("type") == "error":
+                    data = response.get("data")
+                    code = data.get("code") if isinstance(data, dict) else None
+                    # Only protocol constants are safe diagnostics; never echo an
+                    # arbitrary server message or a subject-defined error code.
+                    if isinstance(code, str) and code in {
+                        item.value for item in WSErrorCode
+                    }:
+                        server_code = code
+                    raise ValueError("server returned an error")
                 expected = "state" if operation == "state" else "observation"
                 if (
                     not isinstance(response, dict)
@@ -340,7 +358,7 @@ def collect_runtime_evidence(
             exchanges=tuple(exchanges),
             observation_schema_json=schema_json,
             failure_phase=phase,
-            failure_reason=f"{phase} failed ({type(exc).__name__})",
+            failure_reason=f"{phase} failed ({server_code or type(exc).__name__})",
             telemetry_json=telemetry_json,
             telemetry_error=telemetry_error,
         )

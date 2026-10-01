@@ -365,3 +365,23 @@ def test_rewriting_bundle_removes_stale_optional_evidence(tmp_path):
     assert not (tmp_path / "replays.json").exists()
     assert not (tmp_path / "session-telemetry.json").exists()
     assert "replays.json" not in (tmp_path / "SHA256SUMS").read_text()
+
+
+def test_redaction_preserves_token_metadata_and_filters_secret_keys():
+    from openenv.validation.runtime.artifacts import _redact
+
+    secret = "hf_abcdefghijk123456789"
+    source = {
+        "task_distribution": "task_distribution",
+        "max_tokens": 100,
+        "prompt_token_ids": [1, 2, 3],
+        "access_token": "opaque-credential",
+        secret: {"description": "public"},
+        "nested": {"key": secret},
+    }
+    filtered = _redact(source)
+    assert filtered["task_distribution"] == "task_distribution"
+    assert filtered["max_tokens"] == 100
+    assert filtered["prompt_token_ids"] == [1, 2, 3]
+    assert filtered["access_token"] == "[REDACTED]"
+    assert secret not in json.dumps(filtered)

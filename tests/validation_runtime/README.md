@@ -34,7 +34,7 @@ checkout with `PYTHONPATH` removed, exercising installed package data and the
 production OpenEnv `/ws` endpoint. Each launch uses a fresh subject.
 
 The image supports controlled `VALIDATION_FAULT` modes: `good`, `bad_reward`,
-`bad_observation`, `missing_done`, `bad_state`, `hung_step`, and `startup_failure`. All fault
+`bad_observation`, `missing_done`, `bad_state`, `hung_step`, `slow_step`, and `startup_failure`. All fault
 switches and wire corruption remain inside test assets. They share one fixture
 and one public runtime plan, so a defect changes one property at a time.
 
@@ -46,8 +46,10 @@ telemetry, container identity and cleanup outcome. A process-only provider expli
 skips fresh-container determinism. Subject-emitted records are compared with the
 independently collected wire trace.
 
-The Docker suite contains 19 required cases: three provider lifecycle tests,
-15 CLI fault/control cases, and one real `echo_env` canary. The hung-step case
+The Docker suite contains 20 required cases: three provider lifecycle tests,
+16 CLI fault/control cases, and one real `echo_env` canary. The slow-step case
+completes a tool call taking more than five seconds within the declared episode
+budget. The hung-step case
 checks the episode deadline; the interruption case sends SIGINT only after a
 container log confirms the second step has begun. Both must retain the completed
 reset/state/step/state prefix and remove their own containers. Each CLI case uses

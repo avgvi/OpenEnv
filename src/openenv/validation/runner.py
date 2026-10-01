@@ -172,8 +172,8 @@ def _runtime(subject, *, skip_build, provider):
             ),
             validation_token=spec.env_vars["OPENENV_VALIDATION_TOKEN"],
         )
-        # A health endpoint without a functioning protocol isn't a startup success.
-        if not evidence.exchanges and evidence.failure_reason:
+        # Protocol collection must finish before its dependent contract checks run.
+        if evidence.failure_reason:
             result = _outcome(
                 "runtime.startup",
                 CheckStatus.FAIL,
@@ -254,8 +254,9 @@ def _runtime(subject, *, skip_build, provider):
                         replay.cleanup_complete is False for replay in evidence.replays
                     )
                 )
-            except (Exception, KeyboardInterrupt):
+            except (Exception, KeyboardInterrupt) as exc:
                 cleanup["completed"] = False
+                cleanup["reason"] = f"subject teardown failed ({type(exc).__name__})"
                 if result is None:
                     result = _outcome(
                         "runtime.startup",

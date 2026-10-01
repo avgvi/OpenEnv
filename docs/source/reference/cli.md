@@ -57,6 +57,20 @@ includes the available lower-level checks but does not claim semantic execution.
 `--skip-build` runs declaration checks and skips runtime execution entirely.
 The Docker provider currently supports CPU workloads and `public` network mode;
 unsupported network or GPU requirements skip runtime before building.
+`--local` explicitly selects this default package mode and rejects a remote URL.
+The declared `episode_timeout_s` bounds collection; a reset or judged step may use
+its remaining budget. Collection failures appear once under `runtime.startup`,
+with dependent contract checks skipped and the completed trace retained.
+
+Validation does not inherit host credentials, and the CLI currently has no secret
+injection mechanism. Environments requiring a judge API key can therefore fail at
+session creation. The observation check currently applies the advertised schema
+to reset and step responses. Step rewards must be finite numbers, even though core
+models allow null rewards; these are the current RFC 008 validation rules.
+
+Cleanup removes run-owned containers. Built images remain in Docker's local cache
+for reuse; the report records their immutable image IDs. Remove an unwanted image
+with `docker image rm <image-id>` after its validation runs have finished.
 
 Runtime reports use schema version 2 and severity policy v2. Static reports for
 v1 manifests retain schema version 1 and policy v1. An explicit v1 policy with a
