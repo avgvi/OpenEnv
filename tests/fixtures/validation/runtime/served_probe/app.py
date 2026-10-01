@@ -73,7 +73,7 @@ class WireFault:
             nonlocal steps
             message = await receive()
             if (
-                self.mode == "hung_step"
+                self.mode in {"hung_step", "slow_step"}
                 and message["type"] == "websocket.receive"
                 and message.get("text")
                 and json.loads(message["text"]).get("type") == "step"
@@ -83,7 +83,10 @@ class WireFault:
                     # Tests signal the CLI only after the collector has completed
                     # a real reset, first step and both corresponding state reads.
                     os.write(1, b"OPENENV_VALIDATION_STEP_BLOCKED\n")
-                    await asyncio.Event().wait()
+                    if self.mode == "slow_step":
+                        await asyncio.sleep(5.2)
+                    else:
+                        await asyncio.Event().wait()
             return message
 
         async def fault_send(message: dict[str, Any]):
@@ -117,6 +120,7 @@ def make_app(mode="good"):
         "missing_done",
         "bad_state",
         "hung_step",
+        "slow_step",
     }:
         raise ValueError(f"Unknown fixture mode: {mode}")
     return WireFault(

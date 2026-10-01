@@ -330,12 +330,10 @@ def test_teardown_failure_preserves_collection_outcome(
     result = next(r for r in report.results if r.check_id == "runtime.startup")
     assert result.status is CheckStatus.ERROR
     assert result.evidence == [
-        "schema request failed"
-        if collection_state == "failed"
-        else "subject built and reached its control endpoint",
+        collected.failure_reason or "subject built and reached its control endpoint",
         "subject teardown failed",
     ]
-    if collection_state != "failed":
+    if collection_state == "complete":
         assert result.measured == {
             "provider": provider.name,
             "image_ref": "sha256:" + "a" * 64,
@@ -344,6 +342,7 @@ def test_teardown_failure_preserves_collection_outcome(
     assert json.loads((bundle / "cleanup.json").read_text()) == {
         "required": True,
         "completed": False,
+        "reason": f"subject teardown failed ({teardown_error.__name__})",
     }
     assert len(json.loads((bundle / "collector-trace.json").read_text())) == len(
         collected.exchanges
@@ -452,3 +451,30 @@ def test_artifacts_encode_invalid_numbers_and_redact_secrets(package, tmp_path):
         payload, parse_constant=lambda x: pytest.fail(f"invalid JSON number {x}")
     )
     assert parsed[0]["response_json"]["reward"] == {"invalid_number": "nan"}
+
+
+@pytest.mark.parametrize("prefix_length", [0, 1, 4])
+def test_collection_failure_is_reported_once_and_dependents_skip(
+    package, monkeypatch, prefix_length
+):
+    collected = replace(
+        measured_episode(),
+        exchanges=measured_episode().exchanges[:prefix_length],
+        failure_phase="step",
+        failure_reason="step failed (TimeoutError)",
+    )
+    monkeypatch.setattr(
+        "openenv.validation.runner.collect_runtime_evidence", lambda *a, **k: collected
+    )
+    report = run_validation(
+        package, max_level=Level.RUNTIME, provider=FakeRuntimeProvider()
+    )
+    checks = {result.check_id: result for result in report.results}
+    assert report.verdict.value == "fail"
+    assert checks["runtime.startup"].status is CheckStatus.FAIL
+    assert checks["runtime.startup"].evidence == [collected.failure_reason]
+    for name in ("reward_well_formed", "observation_schema", "state_contract"):
+        assert checks[f"runtime.{name}"].status is CheckStatus.SKIP
+        assert checks[f"runtime.{name}"].evidence == [
+            "unmet dependencies: runtime.startup"
+        ]

@@ -94,7 +94,7 @@ def collect(monkeypatch):
         }
     )
 
-    def run(connection, *, episode_timeout_s=2, request_timeout_s=1):
+    def run(connection, *, episode_timeout_s=2, request_timeout_s=None):
         monkeypatch.setattr(collector, "connect", lambda *args, **kwargs: connection)
         return collector.collect_runtime_evidence(
             "http://127.0.0.1:8000",
@@ -253,3 +253,36 @@ def test_blocked_os_send_is_interrupted_and_transport_is_closed(collect):
         fallback.join()
         sender.close()
         receiver.close()
+
+
+@pytest.mark.parametrize(
+    "code",
+    ["FACTORY_ERROR", "EXECUTION_ERROR", "hf_abcdefghijk12345", {"unsafe": "payload"}],
+)
+def test_server_error_exposes_only_known_protocol_code(collect, code):
+    connection = EpisodeConnection()
+    connection.recv = lambda timeout: json.dumps(
+        {"type": "error", "data": {"code": code, "message": "private server exception"}}
+    )
+    evidence = collect(connection)
+    expected = (
+        code if isinstance(code, str) and code.endswith("_ERROR") else "ValueError"
+    )
+    assert evidence.failure_reason == f"reset failed ({expected})"
+    assert "private server exception" not in evidence.failure_reason
+    assert len(evidence.exchanges) == 1
+
+
+def test_default_operation_deadline_uses_remaining_episode_budget(collect):
+    connection = EpisodeConnection()
+    receive = connection.recv
+    timeouts = []
+
+    def record_timeout(timeout):
+        timeouts.append(timeout)
+        return receive(timeout)
+
+    connection.recv = record_timeout
+    evidence = collect(connection, episode_timeout_s=60)
+    assert evidence.failure_reason is None
+    assert all(50 < timeout <= 60 for timeout in timeouts)
