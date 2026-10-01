@@ -153,6 +153,36 @@ def test_expired_deadline_makes_no_network_request(monkeypatch):
     assert payload is None and error == "task discovery failed (TimeoutError)"
 
 
+@pytest.mark.parametrize("request_timeout_s,expected", [(None, 12.0), (3.0, 3.0)])
+def test_request_timeout_uses_episode_deadline_unless_explicitly_capped(
+    monkeypatch, request_timeout_s, expected
+):
+    original = httpx.Client
+    timeouts = []
+
+    def respond(request):
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(
+            200,
+            json=["probe"] if request.url.path == "/list_environments" else [],
+        )
+
+    monkeypatch.setattr(discovery.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        discovery.httpx,
+        "Client",
+        lambda **options: original(transport=httpx.MockTransport(respond), **options),
+    )
+    payload, error = discovery.collect_task_evidence(
+        "http://127.0.0.1:8000",
+        deadline=112.0,
+        request_timeout_s=request_timeout_s,
+    )
+    assert error is None and json.loads(payload)["splits"] == []
+    assert len(timeouts) == 2
+    assert all(set(timeout.values()) == {expected} for timeout in timeouts)
+
+
 @pytest.mark.parametrize("split,task", [("train", "😀" * 40), ("s" * 200, None)])
 def test_retained_task_evidence_respects_byte_bound(monkeypatch, split, task):
     monkeypatch.setattr(discovery, "MAX_DISCOVERY_BYTES", 400)

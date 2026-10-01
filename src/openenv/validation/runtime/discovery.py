@@ -11,17 +11,20 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_DISCOVERY_BYTES = 8 * 1024 * 1024
 
 
-def collect_task_evidence(base_url, *, deadline, request_timeout_s=5.0):
+def collect_task_evidence(base_url, *, deadline, request_timeout_s=None):
     """Return raw counts and at most two task specs per split, never a full listing.
 
-    ``deadline`` is the collector's absolute monotonic episode deadline. Errors
-    are sanitized; a failed/unsupported endpoint never becomes an empty success.
+    ``deadline`` is the collector's absolute monotonic episode deadline. Optional
+    ``request_timeout_s`` may further cap each request. Errors are sanitized;
+    a failed/unsupported endpoint never becomes an empty success.
     Task metadata routes intentionally use independent environment instances.
     """
     total_bytes = 0
 
     def remaining():
-        budget = min(request_timeout_s, deadline - time.monotonic())
+        budget = deadline - time.monotonic()
+        if request_timeout_s is not None:
+            budget = min(request_timeout_s, budget)
         if budget <= 0:
             raise TimeoutError("task discovery deadline exceeded")
         return budget
