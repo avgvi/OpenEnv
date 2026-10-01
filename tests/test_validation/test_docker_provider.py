@@ -358,7 +358,7 @@ def test_opt_in_image_build_has_supervisor_owned_tag_and_label(tmp_path, monkeyp
 
     def build(argv, timeout_s):
         if argv[1:3] == ["image", "inspect"]:
-            assert 0 < timeout_s <= 3
+            assert timeout_s == 10
             assert argv[-1] == f"openenv-validation:{owner}"
             return 0, IMAGE, ""
         assert argv[argv.index("--tag") + 1] == f"openenv-validation:{owner}"

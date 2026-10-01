@@ -298,7 +298,7 @@ class DockerValidationProvider:
                         "{{.Id}}",
                         _image_tag(image_owner),
                     ],
-                    min(10, deadline - time.monotonic()),
+                    10,
                 )
                 if code:
                     raise ProviderError("Docker did not publish the owned image")
