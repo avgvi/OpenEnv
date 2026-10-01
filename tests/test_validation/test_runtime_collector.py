@@ -183,6 +183,7 @@ def test_http_deadline_survives_transport_socket_detach():
                 )
                 # TLS wrapping similarly detaches the socket captured at connect.
                 detached = socket.socket(fileno=connection.detach())
+                detached.settimeout(1)  # Bound the regression if cancellation breaks.
                 assert detached.recv(1) == b""
     finally:
         peer.close()
