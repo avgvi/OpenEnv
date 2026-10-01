@@ -63,19 +63,27 @@ def source_digest(package_root: Path) -> str:
         relative_path = path.relative_to(package_root)
         if any(part in _DIGEST_EXCLUDED_DIRS for part in relative_path.parts):
             continue
-        if path.is_symlink():
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
             raise ValueError("validation source may not contain symbolic links")
-        if path.is_file():
-            files.append((relative_path.as_posix(), path))
+        if stat.S_ISREG(info.st_mode):
+            files.append((relative_path.as_posix(), path, info))
+        elif not stat.S_ISDIR(info.st_mode):
+            raise ValueError("validation source must contain regular files")
 
-    for relative_path, path in sorted(files, key=lambda item: item[0]):
+    for relative_path, path, info in sorted(files, key=lambda item: item[0]):
         digest.update(relative_path.encode())
         digest.update(b"\0")
-        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_NONBLOCK", 0)
+        flags = (
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        )
         fd = os.open(path, flags)
         with os.fdopen(fd, "rb") as source:
-            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            opened = os.fstat(source.fileno())
+            if not stat.S_ISREG(opened.st_mode):
                 raise ValueError("validation source must contain regular files")
+            if not os.path.samestat(info, opened):
+                raise ValueError("validation source changed before it could be read")
             while chunk := source.read(1024 * 1024):
                 digest.update(chunk)
         digest.update(b"\0")

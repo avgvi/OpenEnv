@@ -90,9 +90,12 @@ def test_source_digest_uses_portable_relative_paths(tmp_path):
     assert source_digest(package_root) == expected
 
 
-def test_source_digest_does_not_require_nonblocking_open(tmp_path, monkeypatch):
+@pytest.mark.parametrize("flag", ["O_NONBLOCK", "O_NOFOLLOW"])
+def test_source_digest_does_not_require_platform_open_flags(
+    tmp_path, monkeypatch, flag
+):
     (tmp_path / "file.txt").write_bytes(b"contents")
-    monkeypatch.delattr(os, "O_NONBLOCK", raising=False)
+    monkeypatch.delattr(os, flag, raising=False)
 
     assert len(source_digest(tmp_path)) == 64
 
@@ -119,3 +122,30 @@ def test_initial_source_digest_failure_is_reported(monkeypatch, failure):
     )
     assert report.verdict is Verdict.FAIL
     assert "private-source-path" not in report.model_dump_json()
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="platform has no named pipes")
+def test_source_digest_rejects_named_pipes(tmp_path):
+    os.mkfifo(tmp_path / "pipe")
+    with pytest.raises(ValueError, match="regular files"):
+        source_digest(tmp_path)
+
+
+def test_source_digest_rejects_swapped_file_without_nofollow(tmp_path, monkeypatch):
+    package = tmp_path / "package"
+    package.mkdir()
+    source = package / "source.txt"
+    source.write_text("public source")
+    private = tmp_path / "private.txt"
+    private.write_text("private content")
+    original_open = os.open
+
+    def swap_before_open(path, flags):
+        source.unlink()
+        source.symlink_to(private)
+        return original_open(path, flags)
+
+    monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+    monkeypatch.setattr(os, "open", swap_before_open)
+    with pytest.raises(ValueError, match="changed before"):
+        source_digest(package)
