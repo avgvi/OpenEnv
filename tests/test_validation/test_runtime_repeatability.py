@@ -337,10 +337,9 @@ def test_truncated_primary_evidence_never_passes(tmp_path, grader):
     evidence = replace(
         subject.runtime_evidence, failure_reason="step failed (TimeoutError)"
     )
-    expected = (
-        CheckStatus.SKIP if grader is EpisodeDeterminismGrader else CheckStatus.FAIL
-    )
-    assert grader().run(replace(subject, runtime_evidence=evidence)).status is expected
+    result = grader().run(replace(subject, runtime_evidence=evidence))
+    assert result.status is CheckStatus.SKIP
+    assert any("runtime.startup" in reason for reason in result.evidence)
 
 
 @pytest.mark.parametrize("scope", ["session", "container"])
