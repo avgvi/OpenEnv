@@ -1,7 +1,6 @@
 """Bounded raw protocol collection in one OpenEnv orchestration session."""
 
 import json
-import socket
 import threading
 import time
 from urllib.parse import urlsplit, urlunsplit
@@ -12,22 +11,10 @@ from websockets.sync.client import connect
 from ...core.env_server.types import WSErrorCode
 from .contracts import RuntimeEvidence, RuntimePlan, WireExchange
 from .discovery import collect_task_evidence
+from .transport import abort_socket, http_deadline
 
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_TRACE_BYTES = 8 * 1024 * 1024
-
-
-def _abort_transport(connection):
-    # The send thread may hold websockets' protocol lock. Shut down the raw
-    # transport directly so sendall and its concurrent receiver can both exit.
-    try:
-        connection.socket.shutdown(socket.SHUT_RDWR)
-    except OSError:
-        pass  # The peer or another cleanup path may already have closed it.
-    try:
-        connection.socket.close()
-    except OSError:
-        pass  # A concurrent close must not replace the original operation error.
 
 
 def _bounded_call(connection, operation, timeout_s):
@@ -38,7 +25,7 @@ def _bounded_call(connection, operation, timeout_s):
 
     def abort():
         expired.set()
-        _abort_transport(connection)
+        abort_socket(connection.socket)
 
     watchdog = threading.Timer(timeout_s, abort)
     watchdog.daemon = True
@@ -46,7 +33,7 @@ def _bounded_call(connection, operation, timeout_s):
     try:
         operation()
     except KeyboardInterrupt:
-        _abort_transport(connection)
+        abort_socket(connection.socket)
         raise
     except Exception:
         if expired.is_set():
@@ -56,7 +43,7 @@ def _bounded_call(connection, operation, timeout_s):
         watchdog.cancel()
         watchdog.join()
     if expired.is_set() or time.monotonic() >= deadline:
-        _abort_transport(connection)
+        abort_socket(connection.socket)
         raise TimeoutError("transport deadline exceeded")
 
 
@@ -125,12 +112,16 @@ def collect_runtime_evidence(
 
     try:
         with httpx.Client(trust_env=False, follow_redirects=False) as client:
-            with client.stream(
-                "GET",
-                base_url.rstrip("/") + "/schema",
-                timeout=remaining(),
-                headers={"Accept-Encoding": "identity"},
-            ) as response:
+            with (
+                http_deadline(remaining()) as extensions,
+                client.stream(
+                    "GET",
+                    base_url.rstrip("/") + "/schema",
+                    timeout=remaining(),
+                    headers={"Accept-Encoding": "identity"},
+                    extensions=extensions,
+                ) as response,
+            ):
                 response.raise_for_status()
                 # iter_bytes() transparently decompresses. Reject compressed
                 # bodies before touching the stream so the byte budget also
@@ -397,7 +388,7 @@ def collect_runtime_evidence(
             try:
                 _bounded_call(connection, connection.close, 1.0)
             except (Exception, KeyboardInterrupt):
-                _abort_transport(connection)
+                abort_socket(connection.socket)
         return RuntimeEvidence(
             exchanges=tuple(exchanges),
             observation_schema_json=schema_json,
