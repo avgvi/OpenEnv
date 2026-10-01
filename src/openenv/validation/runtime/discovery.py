@@ -6,6 +6,8 @@ from urllib.parse import quote
 
 import httpx
 
+from .transport import http_deadline
+
 MAX_TASK_SPLITS = 64
 MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_DISCOVERY_BYTES = 8 * 1024 * 1024
@@ -31,17 +33,27 @@ def collect_task_evidence(base_url, *, deadline, request_timeout_s=None):
 
     try:
         prefix = base_url.rstrip("/")
-        with httpx.Client(trust_env=False, follow_redirects=False) as client:
+        with httpx.Client(
+            trust_env=False,
+            follow_redirects=False,
+            limits=httpx.Limits(max_keepalive_connections=0),
+        ) as client:
 
             def request(method, route, payload=None):
                 nonlocal total_bytes
-                with client.stream(
-                    method,
-                    prefix + route,
-                    json=payload,
-                    timeout=remaining(),
-                    headers={"Accept-Encoding": "identity"},
-                ) as response:
+                # Each request opens a transport for its deadline watchdog;
+                # pooled connections do not emit the connection trace event.
+                with (
+                    http_deadline(remaining()) as extensions,
+                    client.stream(
+                        method,
+                        prefix + route,
+                        json=payload,
+                        timeout=remaining(),
+                        headers={"Accept-Encoding": "identity"},
+                        extensions=extensions,
+                    ) as response,
+                ):
                     response.raise_for_status()
                     if (
                         response.headers.get("Content-Encoding", "identity")
