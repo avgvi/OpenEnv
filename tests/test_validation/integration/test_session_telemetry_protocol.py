@@ -82,6 +82,7 @@ def test_factory_error_survives_real_telemetry_handshake(
 ):
     class BrokenFactory(SessionEnv):
         def __init__(self):
+            # Fail before base initialization to exercise factory errors.
             raise RuntimeError(TOKEN)
 
     monkeypatch.setenv("OPENENV_VALIDATION_TOKEN", TOKEN)
