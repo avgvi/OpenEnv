@@ -20,6 +20,7 @@ def _evidence_bytes(evidence):
         len(value.encode("utf-8"))
         for value in (
             evidence.observation_schema_json or "",
+            evidence.reset_observation_schema_json or "",
             evidence.telemetry_json or "",
             evidence.tools_json or "",
             evidence.tasks_json or "",

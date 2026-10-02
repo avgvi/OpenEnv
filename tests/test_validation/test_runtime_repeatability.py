@@ -321,6 +321,54 @@ def test_judged_variance_does_not_pool_different_steps(tmp_path):
     assert result.measured["reward_population_variance"] == [0.0, 0.0]
 
 
+@pytest.mark.parametrize("scored", [True, False])
+def test_judged_replays_allow_consistent_unscored_steps(tmp_path, scored):
+    subject = subject_with_replays(tmp_path, judged=True)
+
+    def unscored(evidence):
+        rows = list(evidence.exchanges)
+        prefix = mutate_response(
+            [rows[2]], 0, lambda response: response["data"].update(reward=None)
+        )[0]
+        return replace(
+            evidence,
+            exchanges=tuple(
+                rows[:2] + [prefix, rows[3]] + (rows[2:] if scored else [])
+            ),
+        )
+
+    evidence = unscored(subject.runtime_evidence)
+    evidence = replace(
+        evidence,
+        replays=tuple(
+            replace(row, evidence=unscored(row.evidence)) for row in evidence.replays
+        ),
+    )
+    result = EpisodeDeterminismGrader().run(replace(subject, runtime_evidence=evidence))
+    assert result.status is (CheckStatus.PASS if scored else CheckStatus.SKIP)
+    assert result.measured["reward_population_variance"] == (
+        [None, 0.0] if scored else [None]
+    )
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_judged_null_reward_cannot_hide_changed_scoring_or_terminal_failure(
+    tmp_path, terminal
+):
+    subject = subject_with_replays(tmp_path, judged=True)
+    evidence = subject.runtime_evidence
+    replay = evidence.replays[0]
+    rows = mutate_response(
+        list(replay.evidence.exchanges),
+        2,
+        lambda response: response["data"].update(reward=None, done=terminal),
+    )
+    replay = replace(replay, evidence=replace(replay.evidence, exchanges=tuple(rows)))
+    evidence = replace(evidence, replays=(replay,) + evidence.replays[1:])
+    result = EpisodeDeterminismGrader().run(replace(subject, runtime_evidence=evidence))
+    assert result.status is CheckStatus.FAIL
+
+
 @pytest.mark.parametrize("grader", [SeedControlGrader, TrajectoryRecordGrader])
 def test_malformed_telemetry_is_a_finding(tmp_path, grader):
     subject = subject_with_replays(tmp_path)

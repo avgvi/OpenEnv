@@ -277,6 +277,8 @@ class RuntimeEvidence:
             Task split descriptors, counts and bounded item samples.
         tasks_error (`str`, *optional*):
             Sanitized task-discovery failure, independent of tool discovery.
+        reset_observation_schema_json (`str`, *optional*):
+            Explicit `/schema` reset_observation value; absent means use the step schema.
     """
 
     exchanges: tuple[WireExchange, ...] = ()
@@ -291,6 +293,7 @@ class RuntimeEvidence:
     tools_error: str | None = None
     tasks_json: str | None = None
     tasks_error: str | None = None
+    reset_observation_schema_json: str | None = None
 
 
 @dataclass(frozen=True)

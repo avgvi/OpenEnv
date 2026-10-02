@@ -519,12 +519,24 @@ privileged oracle inputs nor host callbacks may be substituted for public action
 One collector owns reset, ordered actions until termination, and state reads on
 **one** WebSocket session. It records immutable raw request/response strings before
 client defaults or Pydantic coercion can hide malformed responses. Graders consume
-that evidence and cannot mutate the measured episode. The advertised observation
-schema is recorded alongside the transcript; reconstruct observation plus the
-separate reward/done envelope before validating it. Reset reward may be null; every
-step reward must be a finite JSON number, excluding booleans, within the declared
-range. State must retain the requested episode identity, reset its step count to
-zero and advance it coherently for successful steps.
+that evidence and cannot mutate the measured episode. `/schema.observation`
+describes step observations. The additive `/schema.reset_observation` field
+describes reset observations; core servers publish it from an explicit optional
+`reset_observation_cls`, defaulting to `observation_cls`. Environments whose reset
+returns a distinct model must declare it. For legacy servers that omit the field,
+the validator applies the step schema to reset as well. An explicitly malformed
+reset schema is a failure, never a reason to fall back. Both schemas are recorded
+alongside the transcript; reconstruct observation plus the separate reward/done
+envelope before validating against the operation's schema. Neither schema may
+retrieve non-local references.
+
+Reset reward may be null. A step with `done: false` may have null reward to denote
+that no score was emitted. A terminal step must emit a finite JSON number within
+the declared range. Every numeric reset or step reward is checked against that
+range; booleans are invalid under this Level Two profile. This does not narrow the
+core Observation model's backward-compatible reward type. State must retain the
+requested episode identity, reset its step count to zero and advance it coherently
+for successful steps.
 
 ### Startup, policy and provider supervision
 
@@ -582,6 +594,10 @@ policy-owned volatile metadata can be excluded. Authors cannot exclude fields.
 For `llm_judged`, the bounded variance path uses 20 completed identical-input fresh
 replays and population reward variance in reward-squared units, compared to the
 declared bound. The total run budget bounds all samples; fewer than 20 is incomplete.
+An unscored non-terminal step contributes no reward variance. Its null position must
+agree across replays; a null/numeric mismatch is a divergence. Variance is measured
+separately at each numeric step position, and an entirely unscored episode is
+incomplete rather than passing. Terminal null rewards remain invalid.
 This procedure is a runtime check, not a statistical confidence claim.
 
 The initial implementation compares the baseline against a new session and an
