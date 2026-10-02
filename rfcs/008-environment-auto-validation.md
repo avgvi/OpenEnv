@@ -582,6 +582,10 @@ policy-owned volatile metadata can be excluded. Authors cannot exclude fields.
 For `llm_judged`, the bounded variance path uses 20 completed identical-input fresh
 replays and population reward variance in reward-squared units, compared to the
 declared bound. The total run budget bounds all samples; fewer than 20 is incomplete.
+An unscored non-terminal step contributes no reward variance. Its null position must
+agree across replays; a null/numeric mismatch is a divergence. Variance is measured
+separately at each numeric step position, and an entirely unscored episode is
+incomplete rather than passing. Terminal null rewards remain invalid.
 This procedure is a runtime check, not a statistical confidence claim.
 
 The initial implementation compares the baseline against a new session and an
