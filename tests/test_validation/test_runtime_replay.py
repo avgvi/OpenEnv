@@ -246,7 +246,7 @@ def test_failed_baseline_is_returned_without_further_execution(monkeypatch):
     values[-1].assert_not_called()
 
 
-@pytest.mark.parametrize("budget,retained_samples", [(12, 1), (22, 3), (32, 3)])
+@pytest.mark.parametrize("budget,retained_samples", [(14, 1), (26, 3), (38, 3)])
 def test_retained_byte_budget_counts_primary_and_all_raw_fields(
     monkeypatch, budget, retained_samples
 ):
@@ -255,9 +255,10 @@ def test_retained_byte_budget_counts_primary_and_all_raw_fields(
     sample = RuntimeEvidence(
         exchanges=(WireExchange("step", "aa", "bbb"),),
         observation_schema_json="é",
+        reset_observation_schema_json="é",
         telemetry_json="xyz",
     )
-    assert replay._evidence_bytes(sample) == 10
+    assert replay._evidence_bytes(sample) == 12
     values[-1].return_value = sample
     monkeypatch.setattr(replay, "MAX_REPLAY_BYTES", budget)
     result = run(values)
@@ -268,12 +269,12 @@ def test_retained_byte_budget_counts_primary_and_all_raw_fields(
     )
     assert retained <= budget
     assert result.observation_schema_json == "é"
-    if budget >= 22:
+    if budget >= 26:
         container = next(row for row in result.replays if row.scope == "container")
         assert container.cleanup_complete is True
         assert json.loads(container.provider_json)["container_id"] == "fresh"
         values[2].stop.assert_called_once()
-        if budget == 22:
+        if budget == 26:
             assert not container.evidence.exchanges
 
 

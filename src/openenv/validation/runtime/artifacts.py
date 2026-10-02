@@ -91,12 +91,23 @@ def write_runtime_bundle(
                 schema = json.loads(evidence.observation_schema_json)
             except (ValueError, RecursionError):
                 schema_parse_failed = True
+        reset_schema = None
+        reset_schema_parse_failed = False
+        if evidence.reset_observation_schema_json is not None:
+            try:
+                reset_schema = json.loads(evidence.reset_observation_schema_json)
+            except (ValueError, RecursionError):
+                reset_schema_parse_failed = True
         collector_metadata = {
             "evidence_schema_version": "1",
             "trace_file": "collector-trace.json",
             "observation_schema": schema,
             "schema_available": evidence.observation_schema_json is not None,
             "schema_parse_failed": schema_parse_failed,
+            "reset_observation_schema": reset_schema,
+            "reset_schema_available": evidence.reset_observation_schema_json
+            is not None,
+            "reset_schema_parse_failed": reset_schema_parse_failed,
             "omitted_trace_fields": omitted_fields,
             "failure_phase": evidence.failure_phase,
             "failure_reason": evidence.failure_reason,
@@ -118,6 +129,7 @@ def write_runtime_bundle(
             or schema_parse_failed
             or telemetry_parse_failed
             or _redact(telemetry) != telemetry
+            or reset_schema_parse_failed
             or _redact(trace) != trace
             or _redact(collector_metadata) != collector_metadata
         )
@@ -151,6 +163,7 @@ def write_runtime_bundle(
             for key, raw in (
                 ("telemetry", sample.telemetry_json),
                 ("schema", sample.observation_schema_json),
+                ("reset_schema", sample.reset_observation_schema_json),
                 ("provider", replay.provider_json),
             ):
                 row[f"{key}_available"] = raw is not None

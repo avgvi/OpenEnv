@@ -22,6 +22,7 @@ def collect(
     malformed=False,
     opening_reply=None,
     opening_error=None,
+    send_error=None,
 ):
     original = httpx.Client
     monkeypatch.setattr(
@@ -38,6 +39,8 @@ def collect(
     class Connection:
         def send(self, raw):
             self.request = json.loads(raw)
+            if self.request["type"] == "validation_open" and send_error is not None:
+                raise send_error
 
         def recv(self, timeout):
             operation = self.request["type"]
@@ -173,6 +176,73 @@ def test_opening_cancellation_is_not_downgraded_to_optional_telemetry(monkeypatc
     assert error.value.evidence.failure_phase == "validation_open"
     assert not error.value.evidence.exchanges
     assert TOKEN not in repr(error.value.evidence)
+
+
+@pytest.mark.parametrize("code", ["FACTORY_ERROR", "CAPACITY_REACHED", "SESSION_ERROR"])
+@pytest.mark.parametrize("closed_before_send", [False, True])
+def test_terminal_opening_error_preserves_only_its_safe_code(
+    monkeypatch, code, closed_before_send
+):
+    result = collect(
+        monkeypatch,
+        opening_reply=json.dumps(
+            {"type": "error", "data": {"code": code, "message": TOKEN}}
+        ),
+        send_error=ConnectionClosedError(None, None) if closed_before_send else None,
+    )
+    assert result.failure_reason == f"validation_open failed ({code})"
+    assert result.exchanges == ()
+    assert result.telemetry_json is None
+    assert TOKEN not in repr(result)
+
+
+@pytest.mark.parametrize("code", ["UNKNOWN_TYPE", "VALIDATION_ERROR", TOKEN])
+def test_optional_opening_refusal_does_not_fail_the_episode(monkeypatch, code):
+    result = collect(
+        monkeypatch,
+        opening_reply=json.dumps(
+            {"type": "error", "data": {"code": code, "message": TOKEN}}
+        ),
+    )
+    assert result.failure_reason is None
+    assert result.telemetry_json is None
+    assert (
+        result.telemetry_error
+        == "session telemetry unavailable or authorization refused"
+    )
+    assert [row.operation for row in result.exchanges] == [
+        "reset",
+        "state",
+        "step",
+        "state",
+    ]
+    assert TOKEN not in repr(result)
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        "not-json-" + TOKEN,
+        json.dumps(
+            {
+                "type": "validation_open",
+                "data": {"schema_version": 1, "capability": CAPABILITY},
+            }
+        ),
+    ],
+)
+def test_closed_send_cannot_become_an_optional_or_successful_handshake(
+    monkeypatch, reply
+):
+    result = collect(
+        monkeypatch,
+        opening_reply=reply,
+        send_error=ConnectionClosedError(None, None),
+    )
+    assert result.failure_reason == "validation_open failed (ConnectionClosedError)"
+    assert result.exchanges == ()
+    assert result.telemetry_json is None
+    assert TOKEN not in repr(result)
 
 
 @pytest.mark.parametrize("credential", [TOKEN, CAPABILITY])

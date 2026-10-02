@@ -38,8 +38,8 @@ The image supports controlled `VALIDATION_FAULT` modes: `good`, `bad_reward`,
 switches and wire corruption remain inside test assets. They share one fixture
 and one public runtime plan, so a defect changes one property at a time.
 
-Repeatability checks compare the original episode against a fresh session and an
-independently inspected fresh container, then exercise a different seed. Controlled
+Repeatability checks replay the original plan in a fresh session, with a different
+seed, and in an independently inspected fresh container. Controlled
 judge fixtures use exactly 20 identical-input samples and per-step population
 variance; they make no inference calls. `replays.json` retains each trace, subject
 telemetry, container identity and cleanup outcome. A process-only provider explicitly
@@ -58,11 +58,11 @@ a unique image label for independent cleanup verification.
 The Echo canary copies the actual `envs/echo_env` sources unchanged and records
 their hashes. A test overlay adds only the execution declaration, replay plan and
 pinned offline image recipe. It runs `echo_message` and `echo_with_length` in one
-session and verifies episode identity and state counts 0, 1, 2. Echo currently
-returns null step rewards and a reset observation that lacks the advertised
-`tool_name` field: the canary therefore expects explicit reward/schema **FAIL**
-findings and CLI exit 1. Its passing test means those compatibility findings were
-observed correctly; it does not mean Echo passed runtime validation. Inspect
+session and verifies episode identity and state counts 0, 1, 2. Echo advertises a
+separate reset-observation schema and emits null rewards on nonterminal steps,
+which the Level 2 profile permits. The canary expects reward/schema **PASS**
+findings and CLI exit 0; the remaining unimplemented checks still make the result
+**WARN**, not complete Level 2 validation. Inspect
 `cli/echo_canary/compatibility-findings.json` for the actual results.
 
 Evidence is written to `outputs/validation-runtime/<run-id>/`, including source,

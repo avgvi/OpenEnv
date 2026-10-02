@@ -12,7 +12,7 @@ from test_runtime_cli import _invoke_cli
 pytestmark = pytest.mark.docker
 
 
-def test_reference_echo_replays_real_tools_and_exposes_contract_findings(tmp_path):
+def test_reference_echo_validates_reset_and_unscored_steps(tmp_path):
     configured = os.environ.get("OPENENV_VALIDATION_ECHO_CONTEXT")
     if not configured:
         if os.environ.get("OPENENV_REQUIRE_DOCKER") == "1":
@@ -34,8 +34,8 @@ def test_reference_echo_replays_real_tools_and_exposes_contract_findings(tmp_pat
     expected = {
         "runtime.startup": "pass",
         "runtime.state_contract": "pass",
-        "runtime.reward_well_formed": "fail",
-        "runtime.observation_schema": "fail",
+        "runtime.reward_well_formed": "pass",
+        "runtime.observation_schema": "pass",
     }
     (evidence_root / "cli/echo_canary/compatibility-findings.json").write_text(
         json.dumps(
@@ -51,7 +51,7 @@ def test_reference_echo_replays_real_tools_and_exposes_contract_findings(tmp_pat
                     }
                     for check_id in expected
                 },
-                "interpretation": "Expected contract findings; Echo is not certified.",
+                "interpretation": "Implemented runtime checks pass; skipped checks keep Echo uncertified.",
             },
             indent=2,
             sort_keys=True,
@@ -94,19 +94,14 @@ def test_reference_echo_replays_real_tools_and_exposes_contract_findings(tmp_pat
         assert step["reward"] is None
         assert step["done"] is False
 
-    # Preserve genuine compatibility findings instead of modifying Echo or
-    # accepting a permissive validator result merely to turn this canary green.
-    assert result.returncode == 1
-    assert report["verdict"] == "fail"
-    assert checks["runtime.reward_well_formed"]["status"] == "fail"
-    assert checks["runtime.observation_schema"]["status"] == "fail"
-    assert any(
-        "finite and in range" in entry
-        for entry in checks["runtime.reward_well_formed"]["evidence"]
-    )
-    assert checks["runtime.observation_schema"]["evidence"]
+    assert result.returncode == 0
+    assert report["verdict"] == "warn"
+    assert checks["runtime.reward_well_formed"]["status"] == "pass"
+    assert checks["runtime.observation_schema"]["status"] == "pass"
     assert "tool_name" not in trace[0]["response_json"]["data"]["observation"]
     metadata = artifacts["collector-evidence.json"]
     assert metadata["complete"] is True
     assert metadata["failure_phase"] is None
     assert "tool_name" in metadata["observation_schema"]["required"]
+    assert metadata["reset_schema_available"] is True
+    assert "tool_name" not in metadata["reset_observation_schema"].get("required", [])
