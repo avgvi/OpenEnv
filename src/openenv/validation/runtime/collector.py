@@ -212,6 +212,7 @@ def collect_runtime_evidence(
                         ):
                             server_code = _server_error_code(json.loads(raw))
                     except Exception:
+                        # Preserve the original ConnectionClosed if diagnostics fail.
                         pass
                     raise
                 return connection.recv(timeout=remaining())
