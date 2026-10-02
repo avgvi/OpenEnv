@@ -49,11 +49,11 @@ a unique image label for independent cleanup verification.
 The Echo canary copies the actual `envs/echo_env` sources unchanged and records
 their hashes. A test overlay adds only the execution declaration, replay plan and
 pinned offline image recipe. It runs `echo_message` and `echo_with_length` in one
-session and verifies episode identity and state counts 0, 1, 2. Echo currently
-returns null step rewards and a reset observation that lacks the advertised
-`tool_name` field: the canary therefore expects explicit reward/schema **FAIL**
-findings and CLI exit 1. Its passing test means those compatibility findings were
-observed correctly; it does not mean Echo passed runtime validation. Inspect
+session and verifies episode identity and state counts 0, 1, 2. Echo advertises a
+separate reset-observation schema and emits null rewards on nonterminal steps,
+which the Level 2 profile permits. The canary expects reward/schema **PASS**
+findings and CLI exit 0; the remaining unimplemented checks still make the result
+**WARN**, not complete Level 2 validation. Inspect
 `cli/echo_canary/compatibility-findings.json` for the actual results.
 
 Evidence is written to `outputs/validation-runtime/<run-id>/`, including source,

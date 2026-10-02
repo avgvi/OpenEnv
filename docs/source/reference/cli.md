@@ -64,9 +64,15 @@ with dependent contract checks skipped and the completed trace retained.
 
 Validation does not inherit host credentials, and the CLI currently has no secret
 injection mechanism. Environments requiring a judge API key can therefore fail at
-session creation. The observation check currently applies the advertised schema
-to reset and step responses. Step rewards must be finite numbers, even though core
-models allow null rewards; these are the current RFC 008 validation rules.
+session creation.
+
+Observation validation uses the `reset_observation` field from `/schema` for resets
+and `observation` for steps. Servers can declare `reset_observation_cls` when
+reset returns a different observation type; it defaults to the step observation
+class. Older servers without a reset schema use the step schema for both.
+The Level 2 profile permits null rewards on reset and nonterminal steps. Terminal
+steps require numeric rewards, and every numeric reward must be finite and within
+the declared range; boolean rewards are invalid.
 
 Cleanup removes run-owned containers. Built images remain in Docker's local cache
 for reuse; the report records their immutable image IDs. Remove an unwanted image
