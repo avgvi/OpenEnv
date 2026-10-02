@@ -73,7 +73,9 @@ def test_failed_start_is_explicit():
 
 
 @pytest.mark.parametrize("legacy_schema", [False, True])
-def test_real_echo_reset_schema_and_unscored_rewards(legacy_schema):
+def test_real_echo_reset_schema_and_unscored_rewards(legacy_schema, monkeypatch):
+    # The lab deliberately clears PYTHONPATH and tests the installed core wheel.
+    monkeypatch.syspath_prepend(str(Path(__file__).parents[3] / "envs"))
     from echo_env.server.echo_environment import EchoEnvironment
     from openenv.core.env_server.http_server import create_fastapi_app
     from openenv.core.env_server.mcp_types import CallToolAction, CallToolObservation
