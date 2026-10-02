@@ -85,6 +85,7 @@ def test_factory_error_survives_real_telemetry_handshake(
             raise RuntimeError(TOKEN)
 
     monkeypatch.setenv("OPENENV_VALIDATION_TOKEN", TOKEN)
+    monkeypatch.setenv("ENABLE_WEB_INTERFACE", "false")
     app = create_app(BrokenFactory, ValueAction, Observation)
     server = uvicorn.Server(uvicorn.Config(app, log_level="critical"))
     with socket.socket() as listener:
