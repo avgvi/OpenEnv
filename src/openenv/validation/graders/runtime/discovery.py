@@ -271,6 +271,7 @@ class RewardAttributionGrader(RubricIntrospectableGrader):
             }
 
         unsupported = False
+        scored_steps = 0
         for index, (record, step) in enumerate(zip(records, steps, strict=True)):
             if type(record["step_index"]) is not int or record["step_index"] != index:
                 problems.append(
@@ -279,9 +280,12 @@ class RewardAttributionGrader(RubricIntrospectableGrader):
             nodes = _rubric_nodes(record["rubric"])
             if definition(nodes) != definition(baseline):
                 problems.append(f"step {index}: rubric configuration changed")
-            reward = json.loads(step.response_json)["data"]["reward"]
+            data = json.loads(step.response_json)["data"]
+            reward = data["reward"]
             root = nodes["root"]
-            if (
+            unscored = reward is None and data.get("done") is False
+            scored_steps += not unscored
+            if not unscored and (
                 not root["evaluated"]
                 or not _finite(reward)
                 or not math.isclose(root["score"], reward, rel_tol=1e-9, abs_tol=1e-9)
@@ -329,7 +333,9 @@ class RewardAttributionGrader(RubricIntrospectableGrader):
                     problems.append(
                         f"step {index}: child attribution does not match the parent score"
                     )
-        return (
-            problems,
-            "unsupported custom rubric aggregation semantics" if unsupported else None,
+        incomplete = (
+            "unsupported custom rubric aggregation semantics" if unsupported else None
         )
+        if not scored_steps:
+            incomplete = "missing prerequisite: an observed numeric step reward"
+        return problems, incomplete

@@ -622,6 +622,11 @@ evaluation flags. Unevaluated gated children never reuse an earlier score.
 Stock container aggregation is named explicitly; custom rubrics may supply
 `validation_config()` to expose public JSON configuration. Arbitrary attributes
 and `state_dict()` are never serialized as configuration.
+Attribution compares each numeric step reward with its freshly evaluated root
+score. Null non-terminal rewards have no emitted score to compare; their records
+must still have the correct identity, unchanged configuration, and valid evaluated
+aggregation. An entirely unscored episode is incomplete rather than passing
+attribution. Terminal null rewards remain invalid.
 
 The subject server also emits a bounded record of the reset/step/state request
 and response envelopes it executed. The validator captures the wire separately
