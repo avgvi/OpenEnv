@@ -265,9 +265,12 @@ class RuntimeEvidence:
             Collector phase that failed; a truncated transcript cannot pass silently.
         failure_reason (`str`, *optional*):
             Credential-safe explanation of the collection failure.
+        reset_observation_schema_json (`str`, *optional*):
+            Explicit `/schema` reset_observation value; absent means use the step schema.
     """
 
     exchanges: tuple[WireExchange, ...] = ()
     observation_schema_json: str | None = None
     failure_phase: str | None = None
     failure_reason: str | None = None
+    reset_observation_schema_json: str | None = None

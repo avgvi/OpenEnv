@@ -7,7 +7,7 @@ from jsonschema import Draft202012Validator
 from referencing import Registry
 
 # Quoting the 8 MiB raw trace costs at most 16 MiB. The remainder covers the
-# 1 MiB schema after conservative 6x JSON normalization and 2x quoting, plus row
+# 1 MiB combined schemas after conservative 6x normalization and 2x quoting, plus row
 # metadata. Limits apply to bytes, independently of the text stream's encoding.
 MAX_INPUT_BYTES = 32 * 1024 * 1024
 
@@ -29,16 +29,21 @@ def main():
     payload = json.loads(raw)
     problems = []
     try:
-        schema = json.loads(payload["schema_json"])
-        Draft202012Validator.check_schema(schema)
-        # An empty registry has no retrieval callback: unresolved references
-        # cannot trigger host filesystem or network access.
-        validator = Draft202012Validator(schema, registry=Registry())
+        schemas = {"step": payload["schema_json"]}
+        if payload.get("reset_schema_json") is not None:
+            schemas["reset"] = payload["reset_schema_json"]
+        validators = {}
+        for operation, raw_schema in schemas.items():
+            schema = json.loads(raw_schema)
+            Draft202012Validator.check_schema(schema)
+            # An empty registry prevents filesystem and network retrieval.
+            validators[operation] = Draft202012Validator(schema, registry=Registry())
+        validators.setdefault("reset", validators["step"])
         for row in payload["observations"]:
             data = json.loads(row["response_json"])["data"]
             observation = dict(data["observation"])
             observation.update(reward=data["reward"], done=data["done"])
-            for error in validator.iter_errors(observation):
+            for error in validators[row["operation"]].iter_errors(observation):
                 location = "/".join(str(x) for x in error.absolute_schema_path)[:160]
                 missing = ""
                 if error.validator == "required":

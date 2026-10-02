@@ -99,7 +99,6 @@ def test_good_measured_session_passes_each_basic_contract(tmp_path, grader):
     [
         True,
         False,
-        None,
         "0.5",
         [],
         {},
@@ -111,13 +110,79 @@ def test_good_measured_session_passes_each_basic_contract(tmp_path, grader):
         1.1,
     ],
 )
-def test_step_rewards_are_checked_without_coercion(tmp_path, reward):
+@pytest.mark.parametrize("done", [False, True])
+def test_step_rewards_are_checked_without_coercion(tmp_path, reward, done):
     rows = mutate_response(
-        good_rows(), 2, lambda response: response["data"].update(reward=reward)
+        good_rows(),
+        2,
+        lambda response: response["data"].update(reward=reward, done=done),
     )
     result = RewardWellFormedGrader().run(subject_with(tmp_path, rows))
     assert result.status is CheckStatus.FAIL
     assert any("reward" in message for message in result.evidence)
+
+
+@pytest.mark.parametrize("done", [False, True, None, 0])
+def test_null_step_reward_requires_explicit_nonterminal_observation(tmp_path, done):
+    rows = mutate_response(
+        good_rows(), 2, lambda response: response["data"].update(reward=None, done=done)
+    )
+    result = RewardWellFormedGrader().run(subject_with(tmp_path, rows))
+    assert result.status is (CheckStatus.PASS if done is False else CheckStatus.FAIL)
+
+
+def test_explicit_reset_schema_is_independent_of_step_schema(tmp_path):
+    rows = mutate_response(
+        good_rows(),
+        0,
+        lambda response: response["data"].update(observation={"ready": True}),
+    )
+    subject = subject_with(tmp_path, rows)
+    # A legacy single-schema server remains strict about reset fields.
+    assert ObservationSchemaGrader().run(subject).status is CheckStatus.FAIL
+    subject = replace(
+        subject,
+        runtime_evidence=replace(
+            subject.runtime_evidence,
+            reset_observation_schema_json=json.dumps(
+                {
+                    "type": "object",
+                    "properties": {"ready": {"type": "boolean"}},
+                    "required": ["ready"],
+                }
+            ),
+        ),
+    )
+    assert ObservationSchemaGrader().run(subject).status is CheckStatus.PASS
+    malformed = mutate_response(
+        rows, 0, lambda response: response["data"].update(observation={"ready": "yes"})
+    )
+    subject = replace(
+        subject,
+        runtime_evidence=replace(subject.runtime_evidence, exchanges=tuple(malformed)),
+    )
+    assert ObservationSchemaGrader().run(subject).status is CheckStatus.FAIL
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        None,
+        [],
+        {"type": "invalid"},
+        False,
+        {"$ref": "https://example.invalid/reset.json"},
+    ],
+)
+def test_explicit_invalid_or_rejecting_reset_schema_cannot_fall_back(tmp_path, schema):
+    subject = subject_with(tmp_path)
+    subject = replace(
+        subject,
+        runtime_evidence=replace(
+            subject.runtime_evidence, reset_observation_schema_json=json.dumps(schema)
+        ),
+    )
+    assert ObservationSchemaGrader().run(subject).status is CheckStatus.FAIL
 
 
 def test_missing_step_reward_is_an_explicit_failure(tmp_path):
