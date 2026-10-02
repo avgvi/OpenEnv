@@ -98,7 +98,7 @@ def collect_runtime_evidence(
     """
     deadline = time.monotonic() + episode_timeout_s
     exchanges = []
-    schema_json = None
+    schema_json = reset_schema_json = None
     phase = "schema"
     trace_bytes = 0
     telemetry_json = None
@@ -152,6 +152,14 @@ def collect_runtime_evidence(
             if validation_token and validation_token in schema_payload:
                 raise ValueError("schema contains validation credentials")
             schema_json = schema_payload
+
+            if "reset_observation" in schema:
+                reset_schema_json = json.dumps(
+                    schema["reset_observation"],
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
 
         endpoint = urlsplit(base_url)
         ws_url = urlunsplit(
@@ -360,12 +368,14 @@ def collect_runtime_evidence(
             observation_schema_json=schema_json,
             telemetry_json=telemetry_json,
             telemetry_error=telemetry_error,
+            reset_observation_schema_json=reset_schema_json,
         )
     except KeyboardInterrupt:
         raise RuntimeCollectionInterrupted(
             RuntimeEvidence(
                 exchanges=tuple(exchanges),
                 observation_schema_json=schema_json,
+                reset_observation_schema_json=reset_schema_json,
                 failure_phase=phase,
                 failure_reason=f"{phase} failed (KeyboardInterrupt)",
                 telemetry_json=telemetry_json,
@@ -377,6 +387,7 @@ def collect_runtime_evidence(
         return RuntimeEvidence(
             exchanges=tuple(exchanges),
             observation_schema_json=schema_json,
+            reset_observation_schema_json=reset_schema_json,
             failure_phase=phase,
             failure_reason=f"{phase} failed ({server_code or type(exc).__name__})",
             telemetry_json=telemetry_json,

@@ -190,3 +190,40 @@ def test_http_deadline_survives_transport_socket_detach():
         connection.close()
         if detached is not None:
             detached.close()
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [{}, {"reset_observation": None}, {"reset_observation": {"required": ["ready"]}}],
+)
+def test_reset_schema_presence_survives_later_collection_failure(
+    monkeypatch, plan, schema
+):
+    stream = TrackedStream(
+        json.dumps({"observation": {"type": "object"}, **schema}).encode()
+    )
+    schema_transport(monkeypatch, stream)
+    evidence = collector.collect_runtime_evidence(
+        "http://127.0.0.1:8000", plan, episode_timeout_s=2
+    )
+    assert evidence.failure_phase == "connect"
+    assert evidence.reset_observation_schema_json == (
+        json.dumps(schema["reset_observation"], separators=(",", ":"))
+        if "reset_observation" in schema
+        else None
+    )
+
+
+def test_reset_schema_shares_entire_response_byte_budget(monkeypatch, plan):
+    stream = TrackedStream(
+        json.dumps(
+            {"observation": {}, "reset_observation": {"description": "x" * 100}}
+        ).encode()
+    )
+    schema_transport(monkeypatch, stream)
+    monkeypatch.setattr(collector, "MAX_MESSAGE_BYTES", 64)
+    evidence = collector.collect_runtime_evidence(
+        "http://127.0.0.1:8000", plan, episode_timeout_s=2
+    )
+    assert evidence.failure_phase == "schema"
+    assert evidence.reset_observation_schema_json is None

@@ -77,7 +77,7 @@ class _RuntimeGrader:
 
 
 class RewardWellFormedGrader(_RuntimeGrader):
-    """Require finite numeric step rewards within the manifest's declared range."""
+    """Allow unscored nonterminal steps; bound every emitted numeric reward."""
 
     check_id = "runtime.reward_well_formed"
 
@@ -97,7 +97,9 @@ class RewardWellFormedGrader(_RuntimeGrader):
                 problems.append(f"exchange {index}: missing reward")
                 continue
             reward = data["reward"]
-            if reward is None and exchange.operation == "reset":
+            if reward is None and (
+                exchange.operation == "reset" or data.get("done") is False
+            ):
                 continue
             if (
                 type(reward) not in (int, float)
@@ -122,6 +124,10 @@ class ObservationSchemaGrader(_RuntimeGrader):
         # Submitted schemas must not cause host-side HTTP/file retrieval.
         if _remote_reference(schema):
             return ["observation schema has a non-local reference"]
+        if evidence.reset_observation_schema_json is not None:
+            reset_schema = json.loads(evidence.reset_observation_schema_json)
+            if _remote_reference(reset_schema):
+                return ["reset observation schema has a non-local reference"]
         problems = []
         observations = []
         count = 0
@@ -144,7 +150,11 @@ class ObservationSchemaGrader(_RuntimeGrader):
             # boundary: normalizing numbers such as 1e9 can inflate a valid
             # episode beyond the worker's input limit.
             observations.append(
-                {"index": index, "response_json": exchange.response_json}
+                {
+                    "index": index,
+                    "operation": exchange.operation,
+                    "response_json": exchange.response_json,
+                }
             )
         if count == 0:
             problems.append("no observations were measured")
@@ -157,6 +167,7 @@ class ObservationSchemaGrader(_RuntimeGrader):
                 input=json.dumps(
                     {
                         "schema_json": evidence.observation_schema_json,
+                        "reset_schema_json": evidence.reset_observation_schema_json,
                         "observations": observations,
                     },
                     ensure_ascii=False,

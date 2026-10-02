@@ -88,6 +88,11 @@ def rebuild(directory):
             if metadata["schema_available"]
             else None
         ),
+        reset_observation_schema_json=(
+            json.dumps(metadata["reset_observation_schema"])
+            if metadata["reset_schema_available"]
+            else None
+        ),
         failure_phase=metadata["failure_phase"],
         failure_reason=metadata["failure_reason"],
     )
@@ -256,3 +261,46 @@ def test_redaction_preserves_token_metadata_and_filters_secret_keys():
     assert filtered["prompt_token_ids"] == [1, 2, 3]
     assert filtered["access_token"] == "[REDACTED]"
     assert secret not in json.dumps(filtered)
+
+
+@pytest.mark.parametrize(
+    "reset_schema", [None, "null", '{"required":["missing-reset-field"]}']
+)
+def test_reset_schema_bundle_preserves_selection_and_grader_result(
+    tmp_path, reset_schema
+):
+    original = replace(measured(), reset_observation_schema_json=reset_schema)
+    validation_report = report()
+    write_runtime_bundle(tmp_path, validation_report, evidence=original)
+    replay = rebuild(tmp_path)
+    if reset_schema is None:
+        assert replay.reset_observation_schema_json is None
+    else:
+        assert json.loads(replay.reset_observation_schema_json) == json.loads(
+            reset_schema
+        )
+    subject = Subject(
+        tmp_path, validation_report.manifest, None, None, tmp_path, original
+    )
+    expected = ObservationSchemaGrader().run(subject)
+    actual = ObservationSchemaGrader().run(replace(subject, runtime_evidence=replay))
+    assert actual.status == expected.status
+    assert actual.evidence == expected.evidence
+
+
+@pytest.mark.parametrize(
+    "schema,parse_failed",
+    [("not JSON", True), ('{"description":"hf_abcdefghijk123456789"}', False)],
+)
+def test_reset_schema_omission_or_redaction_is_visible(tmp_path, schema, parse_failed):
+    write_runtime_bundle(
+        tmp_path,
+        report(),
+        evidence=replace(measured(), reset_observation_schema_json=schema),
+    )
+    text = (tmp_path / "collector-evidence.json").read_text()
+    metadata = json.loads(text)
+    assert metadata["reset_schema_available"] is True
+    assert metadata["reset_schema_parse_failed"] is parse_failed
+    assert metadata["redacted"] is True
+    assert "hf_abcdefghijk123456789" not in text
