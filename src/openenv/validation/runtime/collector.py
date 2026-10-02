@@ -154,12 +154,15 @@ def collect_runtime_evidence(
             schema_json = schema_payload
 
             if "reset_observation" in schema:
-                reset_schema_json = json.dumps(
+                reset_schema_payload = json.dumps(
                     schema["reset_observation"],
                     allow_nan=False,
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
+                if validation_token and validation_token in reset_schema_payload:
+                    raise ValueError("schema contains validation credentials")
+                reset_schema_json = reset_schema_payload
 
         endpoint = urlsplit(base_url)
         ws_url = urlunsplit(
