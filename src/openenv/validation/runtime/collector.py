@@ -6,6 +6,7 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import connect
 
 from ...core.env_server.types import WSErrorCode
@@ -15,6 +16,16 @@ from .transport import abort_socket, http_deadline
 
 MAX_MESSAGE_BYTES = 1024 * 1024
 MAX_TRACE_BYTES = 8 * 1024 * 1024
+
+
+def _server_error_code(response):
+    if isinstance(response, dict) and response.get("type") == "error":
+        data = response.get("data")
+        code = data.get("code") if isinstance(data, dict) else None
+        # Only protocol constants are safe diagnostics, never subject error text.
+        if isinstance(code, str) and code in {item.value for item in WSErrorCode}:
+            return code
+    return None
 
 
 def _bounded_call(connection, operation, timeout_s):
@@ -94,7 +105,7 @@ def collect_runtime_evidence(
     """
     deadline = time.monotonic() + episode_timeout_s
     exchanges = []
-    schema_json = None
+    schema_json = reset_schema_json = None
     phase = "schema"
     trace_bytes = 0
     telemetry_json = None
@@ -150,6 +161,17 @@ def collect_runtime_evidence(
                 raise ValueError("schema contains validation credentials")
             schema_json = schema_payload
 
+            if "reset_observation" in schema:
+                reset_schema_payload = json.dumps(
+                    schema["reset_observation"],
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                if validation_token and validation_token in reset_schema_payload:
+                    raise ValueError("schema contains validation credentials")
+                reset_schema_json = reset_schema_payload
+
         endpoint = urlsplit(base_url)
         ws_url = urlunsplit(
             (
@@ -173,10 +195,30 @@ def collect_runtime_evidence(
         complete = False
         try:
 
+            def receive_response(request):
+                nonlocal server_code
+                try:
+                    _bounded_call(
+                        connection, lambda: connection.send(request), remaining()
+                    )
+                except ConnectionClosed:
+                    # Session creation can fail before the first send. recv() still
+                    # delivers a queued error, but the failed send cannot succeed.
+                    try:
+                        raw = connection.recv(timeout=remaining())
+                        if (
+                            isinstance(raw, str)
+                            and len(raw.encode()) <= MAX_TRACE_BYTES
+                        ):
+                            server_code = _server_error_code(json.loads(raw))
+                    except Exception:
+                        pass
+                    raise
+                return connection.recv(timeout=remaining())
+
             def telemetry_request(operation, data, max_bytes=MAX_TRACE_BYTES):
                 request = json.dumps({"type": operation, "data": data})
-                _bounded_call(connection, lambda: connection.send(request), remaining())
-                raw = connection.recv(timeout=remaining())
+                raw = receive_response(request)
                 if not isinstance(raw, str) or len(raw.encode()) > max_bytes:
                     raise ValueError("invalid telemetry response")
                 response = json.loads(raw)
@@ -196,6 +238,14 @@ def collect_runtime_evidence(
                     # Transport failure still aborts this same-session collection.
                     telemetry_error = f"session telemetry failed ({type(exc).__name__})"
                 else:
+                    code = _server_error_code(response)
+                    if code in {
+                        WSErrorCode.FACTORY_ERROR,
+                        WSErrorCode.CAPACITY_REACHED,
+                        WSErrorCode.SESSION_ERROR,
+                    }:
+                        server_code = code
+                        raise ValueError("server returned a terminal error")
                     data = response.get("data")
                     if (
                         response.get("type") == "validation_open"
@@ -287,10 +337,7 @@ def collect_runtime_evidence(
                 if data is not None:
                     request["data"] = data
                 request_json = json.dumps(request, allow_nan=False)
-                _bounded_call(
-                    connection, lambda: connection.send(request_json), remaining()
-                )
-                raw = connection.recv(timeout=remaining())
+                raw = receive_response(request_json)
                 if not isinstance(raw, str):
                     raise ValueError("binary response is not the JSON protocol")
                 if len(raw.encode("utf-8")) > MAX_MESSAGE_BYTES:
@@ -322,14 +369,7 @@ def collect_runtime_evidence(
                 )
                 response = json.loads(raw)
                 if isinstance(response, dict) and response.get("type") == "error":
-                    data = response.get("data")
-                    code = data.get("code") if isinstance(data, dict) else None
-                    # Only protocol constants are safe diagnostics; never echo an
-                    # arbitrary server message or a subject-defined error code.
-                    if isinstance(code, str) and code in {
-                        item.value for item in WSErrorCode
-                    }:
-                        server_code = code
+                    server_code = _server_error_code(response)
                     raise ValueError("server returned an error")
                 expected = "state" if operation == "state" else "observation"
                 if (
@@ -398,12 +438,14 @@ def collect_runtime_evidence(
             tools_error=tools_error,
             tasks_json=tasks_json,
             tasks_error=tasks_error,
+            reset_observation_schema_json=reset_schema_json,
         )
     except KeyboardInterrupt:
         raise RuntimeCollectionInterrupted(
             RuntimeEvidence(
                 exchanges=tuple(exchanges),
                 observation_schema_json=schema_json,
+                reset_observation_schema_json=reset_schema_json,
                 failure_phase=phase,
                 failure_reason=f"{phase} failed (KeyboardInterrupt)",
                 telemetry_json=telemetry_json,
@@ -419,6 +461,7 @@ def collect_runtime_evidence(
         return RuntimeEvidence(
             exchanges=tuple(exchanges),
             observation_schema_json=schema_json,
+            reset_observation_schema_json=reset_schema_json,
             failure_phase=phase,
             failure_reason=f"{phase} failed ({server_code or type(exc).__name__})",
             telemetry_json=telemetry_json,

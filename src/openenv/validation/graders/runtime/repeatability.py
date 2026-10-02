@@ -224,7 +224,11 @@ class EpisodeDeterminismGrader(_RuntimeGrader):
                 if row["operation"] != "step":
                     continue
                 if judged:
-                    reward = row["response"]["data"]["reward"]
+                    data = row["response"]["data"]
+                    reward = data["reward"]
+                    if reward is None and data.get("done") is False:
+                        sample_rewards.append(None)
+                        continue
                     low, high = subject.manifest.reward.range
                     if (
                         type(reward) not in (int, float)
@@ -237,7 +241,8 @@ class EpisodeDeterminismGrader(_RuntimeGrader):
                             measured,
                         )
                     sample_rewards.append(reward)
-                    row["response"]["data"]["reward"] = None
+                    # Keep null versus numeric positions visible to trace comparison.
+                    data["reward"] = 0.0
             rewards.append(sample_rewards)
         # Policy-owned volatile exclusions are deliberately empty. All replays
         # use the same episode identity; no author field can suppress a difference.
@@ -273,7 +278,10 @@ class EpisodeDeterminismGrader(_RuntimeGrader):
                 measured,
             )
         if judged:
-            variances = [statistics.pvariance(values) for values in zip(*rewards)]
+            variances = [
+                None if values[0] is None else statistics.pvariance(values)
+                for values in zip(*rewards)
+            ]
             measured.update(
                 reward_population_variance=variances,
                 variance_units="reward_squared",
@@ -282,7 +290,7 @@ class EpisodeDeterminismGrader(_RuntimeGrader):
             if type(bound) not in (int, float) or not math.isfinite(bound) or bound < 0:
                 return CheckStatus.FAIL, ["invalid declared variance bound"], measured
             for index, variance in enumerate(variances):
-                if variance > bound:
+                if variance is not None and variance > bound:
                     return (
                         CheckStatus.FAIL,
                         [
@@ -290,6 +298,12 @@ class EpisodeDeterminismGrader(_RuntimeGrader):
                         ],
                         measured,
                     )
+            if not any(variance is not None for variance in variances):
+                return (
+                    CheckStatus.SKIP,
+                    ["missing prerequisite: an observed numeric step reward"],
+                    measured,
+                )
         if any(
             row.scope == "container" and row.cleanup_complete is not True
             for row in replays

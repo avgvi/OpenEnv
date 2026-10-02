@@ -1,15 +1,21 @@
 """Exercise the real replay WebSocket and its separate production MCP boundary."""
 
 import json
+import socket
+import threading
+import time
 
 import pytest
+import uvicorn
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from fastmcp import FastMCP
-from openenv.core.env_server.http_server import HTTPEnvServer
+from openenv.core.env_server.http_server import create_app, HTTPEnvServer
 from openenv.core.env_server.interfaces import Environment
 from openenv.core.env_server.types import Action, Observation, State
 from openenv.core.rubrics import Rubric, WeightedSum
+from openenv.validation.runtime import collector
+from openenv.validation.runtime.contracts import RuntimePlan
 
 TOKEN = "per-run-validation-test-token-000000000000"
 
@@ -68,6 +74,62 @@ class AsyncSeed(SessionEnv):
 class AsyncDropsSeed(SessionEnv):
     async def reset_async(self):
         return super().reset()
+
+
+@pytest.mark.parametrize("closed_before_send", [False, True])
+def test_factory_error_survives_real_telemetry_handshake(
+    monkeypatch, closed_before_send
+):
+    class BrokenFactory(SessionEnv):
+        def __init__(self):
+            raise RuntimeError(TOKEN)
+
+    monkeypatch.setenv("OPENENV_VALIDATION_TOKEN", TOKEN)
+    app = create_app(BrokenFactory, ValueAction, Observation)
+    server = uvicorn.Server(uvicorn.Config(app, log_level="critical"))
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
+        thread.start()
+        try:
+            deadline = time.monotonic() + 5
+            while not server.started:
+                assert thread.is_alive() and time.monotonic() < deadline
+                time.sleep(0.01)
+            if closed_before_send:
+                real_connect = collector.connect
+
+                def connect_after_close(*args, **kwargs):
+                    connection = real_connect(*args, **kwargs)
+                    deadline = time.monotonic() + 2
+                    while connection.close_code is None:
+                        assert time.monotonic() < deadline
+                        time.sleep(0.01)
+                    return connection
+
+                monkeypatch.setattr(collector, "connect", connect_after_close)
+            plan = RuntimePlan.model_validate(
+                {
+                    "plan_schema_version": "1",
+                    "reset": {"episode_id": "factory-failure", "seed": 1},
+                    "actions": [{"value": 0.5}],
+                }
+            )
+            evidence = collector.collect_runtime_evidence(
+                f"http://127.0.0.1:{port}",
+                plan,
+                episode_timeout_s=3,
+                validation_token=TOKEN,
+            )
+            assert evidence.failure_reason == "validation_open failed (FACTORY_ERROR)"
+            assert evidence.exchanges == ()
+            assert evidence.telemetry_json is None
+            assert TOKEN not in repr(evidence)
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+            assert not thread.is_alive()
 
 
 def app_for(monkeypatch, env=SessionEnv, *, enabled=True, mode="simulation"):

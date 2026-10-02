@@ -115,6 +115,55 @@ def test_matching_discovery_and_fresh_attribution_pass(tmp_path, grader):
     assert grader().run(subject(tmp_path)).status is CheckStatus.PASS
 
 
+@pytest.mark.parametrize("scored", [True, False])
+@pytest.mark.parametrize("evaluated", [True, False])
+def test_unscored_steps_do_not_require_an_emitted_root_score(
+    tmp_path, scored, evaluated
+):
+    payload = telemetry()
+    if not evaluated:
+        for item in payload["attribution"][0]["rubric"]:
+            item.update(evaluated=False, score=None)
+    measured = subject(tmp_path, snapshot=payload, reward=None)
+    if scored:
+        payload["attribution"].append(
+            {"step_index": 1, "rubric": copy.deepcopy(telemetry()["rubric"])}
+        )
+        measured.runtime_evidence.telemetry_json = json.dumps(payload)
+        measured.runtime_evidence.exchanges += subject(
+            tmp_path
+        ).runtime_evidence.exchanges
+    result = RewardAttributionGrader().run(measured)
+    assert result.status is (CheckStatus.PASS if scored else CheckStatus.SKIP)
+
+
+@pytest.mark.parametrize("mutation", ["identity", "configuration", "aggregation"])
+def test_unscored_steps_still_validate_supplied_attribution(tmp_path, mutation):
+    payload = telemetry()
+    record = payload["attribution"][0]
+    if mutation == "identity":
+        record["step_index"] = 1
+    elif mutation == "configuration":
+        record["rubric"][0]["config"]["weights"] = [0.5, 0.5]
+    else:
+        record["rubric"][0]["score"] = 0.2
+    result = RewardAttributionGrader().run(
+        subject(tmp_path, snapshot=payload, reward=None)
+    )
+    assert result.status is CheckStatus.FAIL
+
+
+def test_null_terminal_reward_is_not_an_unscored_step(tmp_path):
+    measured = subject(tmp_path, reward=None)
+    step = measured.runtime_evidence.exchanges[0]
+    response = json.loads(step.response_json)
+    response["data"]["done"] = True
+    measured.runtime_evidence.exchanges = (
+        replace(step, response_json=json.dumps(response)),
+    )
+    assert RewardAttributionGrader().run(measured).status is CheckStatus.FAIL
+
+
 def test_genuinely_empty_tools_pass_but_unsupported_discovery_does_not(tmp_path):
     measured = subject(tmp_path, tools_json='{"tools": []}')
     measured.manifest.capabilities.declared_tools = []

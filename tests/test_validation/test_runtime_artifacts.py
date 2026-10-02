@@ -92,6 +92,11 @@ def rebuild(directory):
             if metadata["schema_available"]
             else None
         ),
+        reset_observation_schema_json=(
+            json.dumps(metadata["reset_observation_schema"])
+            if metadata["reset_schema_available"]
+            else None
+        ),
         failure_phase=metadata["failure_phase"],
         failure_reason=metadata["failure_reason"],
     )
@@ -244,7 +249,9 @@ def test_telemetry_redaction_or_omission_marks_bundle_modified(tmp_path, telemet
 
 def test_replay_artifact_retains_transcript_telemetry_identity_and_cleanup(tmp_path):
     sample = replace(
-        measured(), telemetry_json='{"schema_version":1,"seed":{"value":42}}'
+        measured(),
+        telemetry_json='{"schema_version":1,"seed":{"value":42}}',
+        reset_observation_schema_json='{"type":"object"}',
     )
     original = replace(
         measured(),
@@ -273,6 +280,7 @@ def test_replay_artifact_retains_transcript_telemetry_identity_and_cleanup(tmp_p
             for exchange in sample.exchanges
         ]
         assert row["schema"] == json.loads(sample.observation_schema_json)
+        assert row["reset_schema"] == json.loads(sample.reset_observation_schema_json)
         assert row["telemetry"] == json.loads(sample.telemetry_json)
         assert row["redacted"] is False
     container = artifact["samples"][1]
@@ -291,6 +299,7 @@ def test_replay_artifact_redacts_each_independent_evidence_source(tmp_path):
             ),
         ),
         observation_schema_json='{"description":"Bearer private-schema"}',
+        reset_observation_schema_json='{"description":"Bearer private-reset-schema"}',
         telemetry_json='{"rubric":{"api_key":"private-telemetry"}}',
         failure_reason="Authorization: Bearer private-failure",
     )
@@ -316,6 +325,7 @@ def test_malformed_replay_omissions_are_explicit_and_do_not_leak_raw_data(tmp_pa
     sample = RuntimeEvidence(
         exchanges=(WireExchange("step", malformed, malformed),),
         observation_schema_json=malformed,
+        reset_observation_schema_json=malformed,
         telemetry_json=malformed,
     )
     original = replace(
@@ -330,14 +340,23 @@ def test_malformed_replay_omissions_are_explicit_and_do_not_leak_raw_data(tmp_pa
         {"exchange_index": 0, "field": "request_json"},
         {"exchange_index": 0, "field": "response_json"},
     ]
-    assert row["omitted_evidence_fields"] == ["telemetry", "schema", "provider"]
+    assert row["omitted_evidence_fields"] == [
+        "telemetry",
+        "schema",
+        "reset_schema",
+        "provider",
+    ]
 
 
 def test_replay_artifact_distinguishes_absent_fields_from_json_null(tmp_path):
     samples = tuple(
         ReplayEvidence(
             "session",
-            RuntimeEvidence(observation_schema_json=value, telemetry_json=value),
+            RuntimeEvidence(
+                observation_schema_json=value,
+                reset_observation_schema_json=value,
+                telemetry_json=value,
+            ),
             value,
         )
         for value in (None, "null")
@@ -346,7 +365,7 @@ def test_replay_artifact_distinguishes_absent_fields_from_json_null(tmp_path):
         tmp_path, report(), evidence=replace(measured(), replays=samples)
     )
     rows = json.loads((tmp_path / "replays.json").read_text())["samples"]
-    for key in ("schema", "telemetry", "provider"):
+    for key in ("schema", "reset_schema", "telemetry", "provider"):
         assert rows[0][key] is rows[1][key] is None
         assert rows[0][f"{key}_available"] is False
         assert rows[1][f"{key}_available"] is True
@@ -474,3 +493,46 @@ def test_redaction_preserves_token_metadata_and_filters_secret_keys():
     assert filtered["prompt_token_ids"] == [1, 2, 3]
     assert filtered["access_token"] == "[REDACTED]"
     assert secret not in json.dumps(filtered)
+
+
+@pytest.mark.parametrize(
+    "reset_schema", [None, "null", '{"required":["missing-reset-field"]}']
+)
+def test_reset_schema_bundle_preserves_selection_and_grader_result(
+    tmp_path, reset_schema
+):
+    original = replace(measured(), reset_observation_schema_json=reset_schema)
+    validation_report = report()
+    write_runtime_bundle(tmp_path, validation_report, evidence=original)
+    replay = rebuild(tmp_path)
+    if reset_schema is None:
+        assert replay.reset_observation_schema_json is None
+    else:
+        assert json.loads(replay.reset_observation_schema_json) == json.loads(
+            reset_schema
+        )
+    subject = Subject(
+        tmp_path, validation_report.manifest, None, None, tmp_path, original
+    )
+    expected = ObservationSchemaGrader().run(subject)
+    actual = ObservationSchemaGrader().run(replace(subject, runtime_evidence=replay))
+    assert actual.status == expected.status
+    assert actual.evidence == expected.evidence
+
+
+@pytest.mark.parametrize(
+    "schema,parse_failed",
+    [("not JSON", True), ('{"description":"hf_abcdefghijk123456789"}', False)],
+)
+def test_reset_schema_omission_or_redaction_is_visible(tmp_path, schema, parse_failed):
+    write_runtime_bundle(
+        tmp_path,
+        report(),
+        evidence=replace(measured(), reset_observation_schema_json=schema),
+    )
+    text = (tmp_path / "collector-evidence.json").read_text()
+    metadata = json.loads(text)
+    assert metadata["reset_schema_available"] is True
+    assert metadata["reset_schema_parse_failed"] is parse_failed
+    assert metadata["redacted"] is True
+    assert "hf_abcdefghijk123456789" not in text
